@@ -1,0 +1,62 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flued-dynamics"
+version = "0.1.0"
+description = "Transient heat transfer and buoyancy-driven flow simulation for chimney/flue systems"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.9"
+authors = [
+    {name = "LBNL", email = "noreply@lbl.gov"}
+]
+keywords = ["chimney", "flue", "heat-transfer", "simulation", "buoyancy"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Physics",
+]
+
+dependencies = [
+    "numpy>=1.20.0",
+    "scipy>=1.7.0",
+    "pandas>=1.3.0",
+    "matplotlib>=3.4.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=3.0.0",
+    "jupyter>=1.0.0",
+    "joblib>=1.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/lbnl/flued-dynamics"
+Documentation = "https://github.com/lbnl/flued-dynamics#readme"
+Repository = "https://github.com/lbnl/flued-dynamics"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["flued_module*"]
+
+[tool.setuptools.package-data]
+flued_module = ["data/*.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+
+[tool.coverage.run]
+source = ["flued_module"]
+omit = ["*/tests/*", "*/__pycache__/*"]

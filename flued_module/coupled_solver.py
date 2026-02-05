@@ -6,6 +6,25 @@ from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
 import logging
 
+from .flow.elbows import base_K
+from .mass_flow import calculate_leakage_mass_flow, calculate_accel_pressure_loss
+
+@dataclass
+class MomentumConfig:
+    """Master configuration for momentum/pressure physics features
+
+    When distributed_draft_model is True, all sub-features auto-enable.
+    Individual features can be toggled independently when master is False.
+    """
+    distributed_draft_model: bool = False  # Master switch - enables all features
+    use_distributed_leakage: bool = False  # Leakage through pipe joints
+    use_accel_loss: bool = False           # Acceleration/deceleration pressure loss
+    friction_method: str = "current"       # "current" or "colebrook"
+    N_leak_iter: int = 3                   # Iterations for leakage convergence
+    leak_relaxation: float = 0.5           # Relaxation factor for leakage updates
+    C_accel: float = 1.0                   # Acceleration loss coefficient
+
+
 @dataclass
 class ConvergenceMetrics:
     """Metrics for tracking convergence"""
@@ -28,21 +47,34 @@ class CoupledFlowThermalSolver:
     """
     
     def __init__(self, tolerance: float = 1e-3, max_iterations: int = 5,
-                 relaxation_factor: float = 0.3):
+                 relaxation_factor: float = 0.3,
+                 momentum_config: Optional[MomentumConfig] = None):
         """
         Initialize coupled solver
-        
+
         Args:
             tolerance: Convergence tolerance for residuals (relative change < tolerance)
             max_iterations: Maximum coupling iterations per timestep (more = accurate but slow)
             relaxation_factor: Under-relaxation factor for stability (0-1)
                               Lower values = more stable but slower convergence
                               Higher values = faster but may oscillate
+            momentum_config: Configuration for momentum physics features (leakage, accel loss)
         """
         self.tolerance = tolerance
         self.max_iterations = max_iterations
         self.relaxation_factor = relaxation_factor
         self.logger = logging.getLogger(__name__)
+
+        # Momentum physics configuration
+        if momentum_config is None:
+            self.momentum_config = MomentumConfig()
+        else:
+            self.momentum_config = momentum_config
+
+        # Apply master switch
+        if self.momentum_config.distributed_draft_model:
+            self.momentum_config.use_distributed_leakage = True
+            self.momentum_config.use_accel_loss = True
         
         # Adaptive relaxation parameters
         self.min_relaxation = 0.2
@@ -127,7 +159,7 @@ class CoupledFlowThermalSolver:
         # SPECIAL HANDLING FOR STARTUP
         # In first few timesteps, flow is establishing from rest
         # Sequential approach is more stable during this transient
-        if step < 5:
+        if step < 1:
             self._solve_sequential(chimney, step, T_inlet)
             metrics.converged = True
             metrics.iterations = 1
@@ -150,18 +182,27 @@ class CoupledFlowThermalSolver:
         # Set inlet boundary condition
         current_state['temperatures'][0] = T_inlet
         
+        # DISABLED stability detection to ensure full accuracy matches baseline
+        # Always use full iterations for maximum accuracy
+        actual_max_iterations = self.max_iterations
+        
         # Adaptive relaxation
         current_relaxation = self.relaxation_factor
         
         # MAIN COUPLING ITERATIONS
         # Each iteration refines the solution to be more consistent
-        for iteration in range(self.max_iterations):
+        for iteration in range(actual_max_iterations):
             # Store state at start of iteration for convergence check
-            iter_start_state = {
-                'temperatures': current_state['temperatures'].copy(),
-                'mass_flow': current_state['mass_flow'],
-                'pressures': current_state['pressures'].copy()
-            }
+            # Only copy if we need to check convergence (not on last iteration)
+            if iteration < actual_max_iterations - 1:
+                iter_start_state = {
+                    'temperatures': current_state['temperatures'].copy(),
+                    'mass_flow': current_state['mass_flow'],
+                    'pressures': current_state['pressures'].copy()
+                }
+            else:
+                # Last iteration - no need to copy for convergence check
+                iter_start_state = current_state
             
             # STEP 1: UPDATE DENSITIES
             # Gas density depends on temperature (ideal gas law)
@@ -221,8 +262,7 @@ class CoupledFlowThermalSolver:
             # Check for runaway temperatures
             T_max = np.max(current_state['temperatures'])
             if T_max > 1073.15:  # 800°C
-                self.logger.warning(f"Temperature exceeding limits: {T_max-273.15:.0f}°C")
-                # Reduce relaxation to stabilize
+                # Reduce relaxation to stabilize (warning removed)
                 current_relaxation = max(0.1, current_relaxation * 0.5)
             
             if max_residual < self.tolerance:
@@ -248,6 +288,7 @@ class CoupledFlowThermalSolver:
         """Update gas densities based on temperatures"""
         densities = np.zeros_like(temperatures)
         
+        # Single loop - no need to cache for such a simple operation
         for seg in range(chimney.total_segments):
             part_idx, local_seg, part = chimney.get_segment_info(seg)
             densities[seg] = chimney.physics.air_density(temperatures[seg], part.Pa)
@@ -258,18 +299,114 @@ class CoupledFlowThermalSolver:
         """Calculate buoyancy pressure differences"""
         buoyancy = np.zeros_like(densities)
         
+        # Cache ambient densities by part (they don't change)
+        ambient_density_cache = {}
+        
         for seg in range(chimney.total_segments):
             part_idx, local_seg, part = chimney.get_segment_info(seg)
-            segment_height = part.height_m / part.num_segments
+            segment_height = chimney.segment_lengths[seg]
             
-            # Ambient density
-            rho_ambient = chimney.physics.air_density(part.T_ambient_K, part.Pa)
+            # Ambient density - cache by part since it's the same for all segments in a part
+            if part_idx not in ambient_density_cache:
+                ambient_density_cache[part_idx] = chimney.physics.air_density(part.T_ambient_K, part.Pa)
+            rho_ambient = ambient_density_cache[part_idx]
             
             # Buoyancy pressure difference
             buoyancy[seg] = chimney.physics.GRAVITY * segment_height * (rho_ambient - densities[seg])
         
         return buoyancy
-    
+
+    def _calculate_inlet_restriction_resistance(self, chimney, rho_inlet: float) -> float:
+        """Calculate quadratic resistance coefficient for inlet restriction
+
+        Derives R_door such that ΔP_door = R_door × ṁ²
+
+        Starting from the orifice model:
+            ΔP = K × 0.5 × ρ × v²
+            where v = ṁ/(ρ × A_eff)
+
+        Substituting:
+            ΔP = K × 0.5 × ρ × (ṁ/(ρ × A_eff))²
+               = K × 0.5 × ρ × ṁ² / (ρ² × A_eff²)
+               = K × ṁ² / (2 × ρ × A_eff²)
+
+        Therefore:
+            R_door = K / (2 × ρ × A_eff²)
+
+        This resistance is added to total_resistance, ensuring consistent
+        pressure-flow relationships and avoiding numerical issues from
+        dividing by small areas.
+
+        Args:
+            chimney: Chimney object with inlet_restriction config
+            rho_inlet: Gas density at inlet [kg/m³] - use inlet density for consistency
+
+        Returns:
+            Resistance coefficient R_door [Pa·s²/kg²]
+        """
+        # Check if feature enabled
+        if not chimney.inlet_restriction.enable:
+            return 0.0
+
+        # Effective area already includes smooth leakage floor:
+        # A_eff = sqrt(A_eff_raw² + A_leak²)
+        # This ensures finite resistance even when door is fully closed
+        A_eff = chimney.inlet_restriction.effective_area_m2
+
+        # K_equiv = 1/Cd² (computed during initialization)
+        K = chimney.inlet_restriction.K_equiv
+
+        # R_door = K / (2 × ρ × A_eff²)
+        # Using inlet density for consistency (flow enters at inlet conditions)
+        R_door = K / (2.0 * rho_inlet * A_eff**2)
+
+        return R_door
+
+    def _calculate_catalytic_bypass_loss(self, chimney, mass_flow_rate: float,
+                                         densities: np.ndarray) -> float:
+        """Calculate pressure drop from catalytic bypass damper
+
+        Models the bypass/catalyst as a variable resistance based on bypass state.
+        When bypass is open: low K-loss (gases bypass catalyst)
+        When bypass is closed: higher K-loss (gases flow through catalyst honeycomb)
+
+        Args:
+            chimney: Chimney object with catalytic_bypass config
+            mass_flow_rate: Current mass flow rate [kg/s]
+            densities: Array of gas densities at each segment [kg/m³]
+
+        Returns:
+            Pressure drop [Pa] - always positive (resistance opposes flow)
+        """
+        # Check if feature enabled
+        if not chimney.catalytic_bypass.enable:
+            return 0.0
+
+        # Handle zero/very small flow
+        if abs(mass_flow_rate) < 1e-10:
+            return 0.0
+
+        # Get segment index where catalyst is located
+        seg_idx = chimney.catalytic_bypass.segment_index
+
+        # Get segment properties
+        part_idx, local_seg, part = chimney.get_segment_info(seg_idx)
+        area = part.inner_area_m2
+
+        # Gas density at catalyst location
+        rho = densities[seg_idx]
+
+        # Velocity at catalyst location
+        velocity = abs(mass_flow_rate) / (rho * area)
+
+        # Pressure drop from bypass/catalyst
+        # ΔP = K × (1/2) × ρ × v²
+        K = chimney.catalytic_bypass.K_effective
+        dp_bypass = K * 0.5 * rho * velocity**2
+
+        # Return positive value (resistance opposes flow)
+        return dp_bypass
+
     # def _solve_momentum(self, chimney, pressures: np.ndarray, densities: np.ndarray,
     #                    buoyancy: np.ndarray, mass_flow_old: float) -> Tuple[float, np.ndarray]:
     #     """
@@ -331,6 +468,7 @@ class CoupledFlowThermalSolver:
         """Calculate velocities from mass flow rate"""
         velocities = np.zeros_like(densities)
         
+        # Single loop, no unnecessary caching
         for seg in range(chimney.total_segments):
             part_idx, local_seg, part = chimney.get_segment_info(seg)
             velocities[seg] = mass_flow / (densities[seg] * part.inner_area_m2)
@@ -396,95 +534,220 @@ class CoupledFlowThermalSolver:
     def _solve_momentum_improved(self, chimney, pressures: np.ndarray, densities: np.ndarray,
                                 buoyancy: np.ndarray, mass_flow_old: float, dt: float) -> Tuple[float, np.ndarray]:
         """
-        Improved momentum solver with better physics
+        Improved momentum solver with quadratic resistance model
+
+        Uses consistent resistance-based approach:
+            dp_drive = R_total × ṁ²
+            ṁ_steady = sign(dp_drive) × sqrt(|dp_drive| / R_total)
+
+        All resistances (pipe friction, inlet restriction, catalytic bypass)
+        are combined into R_total, avoiding the need for special "decay" modes.
         """
-        # Total driving force
-        total_buoyancy = np.sum(buoyancy)
-        
-        # Calculate resistance more accurately
+        # Total driving force from buoyancy
+        dp_drive = np.sum(buoyancy)
+
+        # Add wind cap boundary effect (if enabled)
+        # Negative deltaP (suction) aids draft → adds to driving force
+        # Positive deltaP (pressurization) hurts draft → reduces driving force
+        Pa_outlet = chimney.parts[-1].Pa if len(chimney.parts) > 0 else 101325.0
+        T_outlet = chimney.parts[-1].T_ambient_K if len(chimney.parts) > 0 else 294.15
+        deltaP_wind = chimney.get_wind_cap_deltaP(chimney.time_step, Pa_outlet, T_outlet)
+        dp_drive = dp_drive - deltaP_wind
+
+        # Apply room depressurization (reduces available draft, can cause backdraft)
+        # Positive room_pressure_offset means room is depressurized (below outdoor pressure)
+        # This reduces the pressure difference driving flow through the chimney
+        room_depress = getattr(chimney, 'room_pressure_offset_Pa', 0.0)
+        dp_drive = dp_drive - room_depress
+
+        # Backflow risk warning
+        if dp_drive < 0 and abs(deltaP_wind) > 0.1:
+            print(f"[WIND CAP WARNING] step={chimney.time_step} Net driving head negative "
+                  f"(stack={np.sum(buoyancy):.1f} Pa + wind={-deltaP_wind:.1f} Pa < 0): backflow risk")
+
+        # Cache segment info to avoid repeated lookups
+        segment_cache = {seg: chimney.get_segment_info(seg) for seg in range(chimney.total_segments)}
+
+        # ============================================================
+        # CALCULATE TOTAL RESISTANCE (R_total)
+        # All resistances are combined: R_total = R_pipe + R_door + R_bypass
+        # ============================================================
         total_resistance = 0.0
         avg_density = np.mean(densities)
-        
+        rho_inlet = densities[0]
+
+        # Cache friction factors and viscosities to avoid recalculation
+        friction_factors = {}
+        viscosity_cache = {}
+
+        # --- 1. Pipe segment resistance ---
         for seg in range(chimney.total_segments):
-            part_idx, local_seg, part = chimney.get_segment_info(seg)
-            
+            part_idx, local_seg, part = segment_cache[seg]
+
             # Segment properties
             area = part.inner_area_m2
             diameter = part.inner_diameter_m
-            length = part.height_m / part.num_segments
-            
-            # Local velocity
-            velocity = mass_flow_old / (densities[seg] * area)
-            
+            length = chimney.segment_lengths[seg]
+
+            # Local velocity (for Re calculation)
+            velocity = mass_flow_old / (densities[seg] * area) if abs(mass_flow_old) > 1e-10 else 0.1
+
             # Viscosity at local temperature
             T_seg = chimney.T_gas[chimney.time_step-1, seg] if chimney.time_step > 0 else part.T_ambient_K + 10
             viscosity = chimney.physics.air_viscosity(T_seg)
-            
+            viscosity_cache[seg] = viscosity
+
             # Reynolds number
             Re = densities[seg] * abs(velocity) * diameter / viscosity
-            Re = max(Re, 10)  # Avoid very low Re
-            
-            # Friction factor including roughness effects
+            Re = max(Re, 100)  # Floor at 100 to avoid extreme f values
+
+            # Friction factor
             if Re < 2300:
                 f = 64 / Re
             else:
-                # Colebrook-White equation for rough pipes
-                # Use iterative solution or approximation
                 relative_roughness = part.roughness_m / diameter
                 if relative_roughness < 1e-6:
-                    # Smooth pipe (Blasius)
-                    f = 0.316 / Re**0.25
+                    f = 0.316 / Re**0.25  # Blasius (smooth)
                 else:
-                    # Rough pipe - Moody approximation
-                    f = 0.25 / (np.log10(relative_roughness/3.7 + 5.74/Re**0.9))**2
-            
-            # Add minor losses if fittings present
-            K_minor = 0.5 if part.has_fittings else 0.0
-            
-            # Total resistance for segment
+                    f = 0.25 / (np.log10(relative_roughness/3.7 + 5.74/Re**0.9))**2  # Swamee-Jain
+
+            friction_factors[seg] = f
+
+            # Minor losses - use actual elbow K values from segment_elbows (Feb 2 fix)
+            K_minor = 0.0
+            elbow_key = (part_idx, local_seg)
+            if hasattr(chimney, 'segment_elbows') and elbow_key in chimney.segment_elbows:
+                for elbow_spec in chimney.segment_elbows[elbow_key]:
+                    K_elbow = base_K(elbow_spec) * elbow_spec.vane_factor
+                    K_minor += K_elbow
+
+            # Segment resistance: R_seg = (f*L/D + K_minor) × ρ / (2 × A²)
             K_total = f * length / diameter + K_minor
-            resistance = K_total * densities[seg] / (2 * area**2)
-            total_resistance += resistance
-        
-        # Cache friction factors calculated above to avoid recalculation
-        friction_factors = {}
-        for seg in range(chimney.total_segments):
-            part_idx, local_seg, part = chimney.get_segment_info(seg)
-            T_seg = chimney.T_gas[chimney.time_step-1, seg] if chimney.time_step > 0 else part.T_ambient_K + 10
-            viscosity = chimney.physics.air_viscosity(T_seg)
-            velocity = mass_flow_old / (densities[seg] * part.inner_area_m2)
-            Re = densities[seg] * abs(velocity) * part.inner_diameter_m / viscosity
-            Re = max(Re, 10)
-            
-            if Re < 2300:
-                friction_factors[seg] = 64 / Re
-            else:
-                relative_roughness = part.roughness_m / part.inner_diameter_m
-                if relative_roughness < 1e-6:
-                    friction_factors[seg] = 0.316 / Re**0.25
-                else:
-                    friction_factors[seg] = 0.25 / (np.log10(relative_roughness/3.7 + 5.74/Re**0.9))**2
-        
-        # Momentum balance: dp_buoyancy = resistance * mdot^2
-        # Solve for new mass flow
-        if total_buoyancy > 0 and total_resistance > 0:
-            # mdot = sqrt(dp_buoyancy / resistance)
-            mass_flow_steady = np.sqrt(total_buoyancy / total_resistance)
-            
-            # Apply inertia (first-order response)
-            # Modified time constant to reduce oscillations
-            tau = avg_density * chimney.parts[0].height_m / (total_resistance * (mass_flow_steady + 1e-6))
-            # Limit alpha to prevent overshooting
-            alpha = min(dt / (tau + dt), 0.5)
-            mass_flow_new = mass_flow_old + alpha * (mass_flow_steady - mass_flow_old)
-        else:
-            # No buoyancy = no flow! This is fundamental physics
-            # Flow decays to zero with time constant
-            tau_decay = avg_density * chimney.parts[0].height_m / (2 * total_resistance * (mass_flow_old + 1e-6))
-            mass_flow_new = mass_flow_old * np.exp(-dt / tau_decay)
-        
-        # Ensure reasonable bounds (but allow zero flow!)
-        mass_flow_new = np.clip(mass_flow_new, 0.0, 1.0)
+            R_seg = K_total * densities[seg] / (2 * area**2)
+            total_resistance += R_seg
+
+        # --- 2. Inlet restriction resistance ---
+        # R_door = K / (2 × ρ_inlet × A_eff²)
+        # This is added to total_resistance (NOT subtracted from dp_drive)
+        R_door = self._calculate_inlet_restriction_resistance(chimney, rho_inlet)
+        total_resistance += R_door
+
+        # --- 3. Catalytic bypass resistance ---
+        # Convert dp_bypass to resistance: R_bypass ≈ dp_bypass / mdot²
+        # (Keeping existing approach for now, but as resistance contribution)
+        if abs(mass_flow_old) > 1e-10:
+            dp_catalytic = self._calculate_catalytic_bypass_loss(chimney, mass_flow_old, densities)
+            R_bypass = dp_catalytic / (mass_flow_old**2) if dp_catalytic > 0 else 0.0
+            total_resistance += R_bypass
+
+        # --- 4. Distributed Leakage (VENT-II Style) ---
+        # Calculate leakage at each segment based on local gauge pressure
+        # Uses iterative approach with relaxation for stability
+        # Leakage IN (negative P_gauge) adds mass, leakage OUT (positive P_gauge) removes mass
+        total_leakage_mdot = 0.0
+        leakage_enabled = (
+            self.momentum_config.use_distributed_leakage or
+            (hasattr(chimney, 'leakage_config') and chimney.leakage_config.enable)
+        )
+
+        if leakage_enabled and hasattr(chimney, 'segment_leakage_area_m2'):
+            # Get iteration parameters from config
+            N_leak_iter = self.momentum_config.N_leak_iter
+            leak_relax = self.momentum_config.leak_relaxation
+
+            # Iterative leakage calculation for convergence
+            for leak_iter in range(N_leak_iter):
+                new_leakage_mdot = 0.0
+
+                for seg in range(chimney.total_segments):
+                    A_leak = chimney.segment_leakage_area_m2[seg]
+                    if A_leak > 0:
+                        part_idx, local_seg, part = segment_cache[seg]
+                        # Estimate gauge pressure from previous iteration
+                        P_gauge = pressures[seg] - part.Pa
+                        rho_ambient = chimney.physics.air_density(part.T_ambient_K, part.Pa)
+                        rho_gas = densities[seg]
+
+                        # Get Cd from chimney config or use default
+                        Cd_leak = 0.61
+                        if hasattr(chimney, 'leakage_config') and chimney.leakage_config.enable:
+                            Cd_leak = chimney.leakage_config.Cd_leak
+
+                        m_leak = calculate_leakage_mass_flow(
+                            P_gauge=P_gauge,
+                            A_leak_m2=A_leak,
+                            Cd_leak=Cd_leak,
+                            rho_ambient=rho_ambient,
+                            rho_gas=rho_gas
+                        )
+                        new_leakage_mdot += m_leak
+
+                # Apply relaxation for stability
+                total_leakage_mdot = (leak_relax * new_leakage_mdot +
+                                      (1 - leak_relax) * total_leakage_mdot)
+
+        # --- 5. Acceleration Loss ---
+        # Pressure cost when gas speeds up due to heating (density decrease)
+        dp_accel_total = 0.0
+        if self.momentum_config.use_accel_loss and abs(mass_flow_old) > 1e-10:
+            C_accel = self.momentum_config.C_accel
+            for seg in range(1, chimney.total_segments):
+                part_idx, local_seg, part = segment_cache[seg]
+                area = part.inner_area_m2
+
+                # Upstream and downstream velocities
+                v_upstream = mass_flow_old / (densities[seg-1] * area)
+                v_downstream = mass_flow_old / (densities[seg] * area)
+
+                dp_accel = calculate_accel_pressure_loss(
+                    rho_upstream=densities[seg-1],
+                    v_upstream=v_upstream,
+                    rho_downstream=densities[seg],
+                    v_downstream=v_downstream,
+                    C_accel=C_accel
+                )
+                dp_accel_total += dp_accel
+
+            # Acceleration loss reduces available driving pressure
+            dp_drive = dp_drive - dp_accel_total
+
+        # Ensure minimum resistance to prevent division by zero
+        total_resistance = max(total_resistance, 1e-6)
+
+        # ============================================================
+        # MOMENTUM BALANCE: dp_drive = R_total × ṁ²
+        # Solve for steady-state mass flow
+        # ============================================================
+        # ṁ_steady = sign(dp_drive) × sqrt(|dp_drive| / R_total)
+        mass_flow_magnitude = np.sqrt(abs(dp_drive) / total_resistance)
+        mass_flow_steady = np.sign(dp_drive) * mass_flow_magnitude
+
+        # Handle case where dp_drive ≈ 0 (naturally gives mdot_steady ≈ 0)
+        if abs(dp_drive) < 1e-10:
+            mass_flow_steady = 0.0
+
+        # Apply inertia (first-order response toward steady state)
+        # Time constant based on system inertia
+        system_length = sum(chimney.segment_lengths)
+        tau = avg_density * system_length / (total_resistance * (abs(mass_flow_steady) + 1e-6))
+        tau = max(tau, dt)  # At least one timestep
+
+        # Relaxation factor (limit to prevent overshooting)
+        alpha = min(dt / (tau + dt), 0.5)
+        mass_flow_new = mass_flow_old + alpha * (mass_flow_steady - mass_flow_old)
+
+        # Apply leakage adjustment to mass flow
+        # Positive leakage = air leaking IN (adds mass) → increases outlet flow
+        # Negative leakage = air leaking OUT (loses mass) → decreases outlet flow
+        mass_flow_new = mass_flow_new + total_leakage_mdot
+
+        # Calculate geometry-based bounds
+        max_velocity = 50.0  # m/s - reasonable upper limit
+        typical_area = chimney.parts[0].inner_area_m2
+        max_mass_flow_magnitude = max_velocity * avg_density * typical_area
+
+        # Allow both positive and negative flow, but limit magnitude
+        mass_flow_new = np.clip(mass_flow_new, -max_mass_flow_magnitude, max_mass_flow_magnitude)
         
         # Update pressure distribution
         new_pressures = np.zeros_like(pressures)
@@ -492,21 +755,49 @@ class CoupledFlowThermalSolver:
         
         for seg in range(1, chimney.total_segments):
             # Pressure change = buoyancy - friction loss
-            part_idx, local_seg, part = chimney.get_segment_info(seg)
+            part_idx, local_seg, part = segment_cache[seg]  # Use cached segment info
             velocity = mass_flow_new / (densities[seg] * part.inner_area_m2)
             
-            # Use cached friction factor
-            f = friction_factors.get(seg, 0.02)  # Default if not found
+            # Recalculate friction factor with new velocity
+            # (Reynolds number changes with new mass flow)
+            # Use pre-computed segment length
+            length = chimney.segment_lengths[seg]
+            diameter = part.inner_diameter_m
+            # Use cached viscosity (temperature hasn't changed within this timestep)
+            viscosity = viscosity_cache.get(seg)
+            if viscosity is None:  # Fallback if not cached
+                T_seg = chimney.T_gas[chimney.time_step-1, seg] if chimney.time_step > 0 else part.T_ambient_K + 10
+                viscosity = chimney.physics.air_viscosity(T_seg)
+            Re_new = densities[seg] * abs(velocity) * diameter / viscosity
+            Re_new = max(Re_new, 10)
+            
+            # Use same friction factor calculation but with new Re
+            if Re_new < 2300:
+                f = 64 / Re_new
+            else:
+                # For turbulent, can often reuse if Re didn't change much
+                # But for accuracy, recalculate with new velocity
+                relative_roughness = part.roughness_m / diameter
+                if relative_roughness < 1e-6:
+                    f = 0.316 / Re_new**0.25
+                else:
+                    f = 0.25 / (np.log10(relative_roughness/3.7 + 5.74/Re_new**0.9))**2
             
             # Pressure drop from friction
-            length = part.height_m / part.num_segments
-            diameter = part.inner_diameter_m
             dp_friction = f * (length / diameter) * 0.5 * densities[seg] * velocity**2
-            
-            # Net pressure change = buoyancy - friction
-            dp_segment = buoyancy[seg-1] - dp_friction
+
+            # Fitting losses (Feb 2 fix) - add to pressure drop
+            dp_minor = 0.0
+            elbow_key = (part_idx, local_seg)
+            if hasattr(chimney, 'segment_elbows') and elbow_key in chimney.segment_elbows:
+                for elbow_spec in chimney.segment_elbows[elbow_key]:
+                    K_elbow = base_K(elbow_spec) * elbow_spec.vane_factor
+                    dp_minor += K_elbow * 0.5 * densities[seg] * velocity**2
+
+            # Net pressure change = buoyancy - friction - fitting losses
+            dp_segment = buoyancy[seg-1] - dp_friction - dp_minor
             new_pressures[seg] = new_pressures[seg-1] + dp_segment
-        
+
         return mass_flow_new, new_pressures
     
     def _solve_energy_improved(self, chimney, step: int, temperatures: np.ndarray,
@@ -519,13 +810,17 @@ class CoupledFlowThermalSolver:
         # Set inlet
         new_temperatures[0] = temperatures[0]  # Already set by boundary condition
         
+        # Cache segment info to avoid repeated lookups
+        segment_cache = {seg: chimney.get_segment_info(seg) for seg in range(chimney.total_segments)}
+        
         # For each segment, use comprehensive heat transfer
         for seg in range(chimney.total_segments):
             # Note: Don't skip segment 0 for wall temperature updates
             # The inlet gas temperature is fixed, but walls still need heating
             
-            part_idx, local_seg, part = chimney.get_segment_info(seg)
-            segment_length = part.height_m / part.num_segments
+            part_idx, local_seg, part = segment_cache[seg]
+            # Use pre-computed segment length
+            segment_length = chimney.segment_lengths[seg]
             
             # Get previous wall temperatures
             if part.type == 'single':
@@ -596,12 +891,23 @@ class CoupledFlowThermalSolver:
             
             # Call comprehensive heat transfer for proper physics
             # This ensures we use the full model, not simplified estimates
-            
-            # Get upstream temperature for advection
-            if seg == 0:
-                T_upstream = temperatures[0]  # Inlet temperature
-            else:
-                T_upstream = temperatures[seg-1]  # Use current iteration's upstream temp
+
+            # Get upstream temperature for advection - UPWIND SCHEME BASED ON FLOW DIRECTION
+            # This allows proper handling of both normal draft and backdraft
+            if mass_flow >= 0:  # UPWARD FLOW (normal draft)
+                if seg == 0:
+                    # Bottom inlet: use inlet boundary condition (from solve_coupled_timestep T_inlet arg)
+                    T_upstream = temperatures[0]  # Already set to T_inlet at line 151
+                else:
+                    # Upstream is segment below
+                    T_upstream = temperatures[seg-1]
+            else:  # DOWNWARD FLOW (backdraft, mass_flow < 0)
+                if seg == chimney.total_segments - 1:
+                    # Top inlet: outdoor/ambient air entering from above
+                    T_upstream = part.T_ambient_K
+                else:
+                    # Upstream is segment above
+                    T_upstream = temperatures[seg+1]
             
             # Calculate segment heat transfer using comprehensive model
             # This will handle convection, radiation, condensation properly
@@ -654,44 +960,55 @@ class CoupledFlowThermalSolver:
             
             # Energy balance for gas control volume
             # CRITICAL PHYSICS: When flow stops (T_gas → T_ambient), heat transfer must also stop
-            
-            if mass_flow > 1e-6 and seg > 0:  # Flowing case (skip inlet)
+
+            # Determine if this segment is an inlet boundary (depends on flow direction)
+            is_inlet_boundary = False
+            if mass_flow >= 0:  # Normal upward flow
+                is_inlet_boundary = (seg == 0)  # Bottom is inlet
+            else:  # Backdraft (downward flow)
+                is_inlet_boundary = (seg == chimney.total_segments - 1)  # Top is inlet
+
+            if abs(mass_flow) > 1e-6 and not is_inlet_boundary:
+                # Flowing case with advection (skip inlet boundaries)
                 # Energy in: mass_flow * cp * T_upstream
                 # Energy out: mass_flow * cp * T_current + q_loss_to_walls + q_latent
                 # Storage: gas_mass * cp * dT/dt
-                
+
                 # Heat loss to walls (positive when gas loses heat)
                 q_loss_to_walls = h_inner * area * (temperatures[seg] - T_wall)
-                
+
                 # Advection terms
                 # Use upwind differencing for stability
-                residence_time = gas_mass / mass_flow  # Time gas spends in segment
-                
+                residence_time = gas_mass / abs(mass_flow)  # Time gas spends in segment (use abs for safety)
+
                 # Temperature change due to advection and heat loss
                 # dT/dt = (T_in - T_out)/tau - Q_loss/(m*cp)
                 # For steady flow: T_out ≈ T_in - Q_loss*tau/(m*cp)
-                
+
                 # Include condensation latent heat if present
                 q_latent = ht_results.get('latent_heat_rate', 0)
                 q_total_loss = q_loss_to_walls + q_latent
-                
+
                 # Stable formulation: new temperature based on upstream and heat loss
                 T_steady = T_upstream - q_total_loss * residence_time / (gas_mass * cp)
-                
+
                 # Apply relaxation toward steady state
-                tau_thermal = gas_mass * cp / (mass_flow * cp + h_inner * area)
+                tau_thermal = gas_mass * cp / (abs(mass_flow) * cp + h_inner * area)
                 alpha = dt / (tau_thermal + dt)
                 new_temperatures[seg] = temperatures[seg] + alpha * (T_steady - temperatures[seg])
-            elif seg == 0:
-                # Inlet segment - temperature is fixed
-                new_temperatures[seg] = temperatures[seg]
+            elif is_inlet_boundary:
+                # Inlet boundary - temperature is fixed by boundary condition
+                if mass_flow >= 0:
+                    # Normal draft: bottom inlet temperature set by appliance/fire
+                    new_temperatures[seg] = temperatures[seg]  # Already set to T_inlet
+                else:
+                    # Backdraft: top inlet temperature is outdoor air
+                    new_temperatures[seg] = part.T_ambient_K
             else:
-                # No/low flow case or after flow case is handled
-                # Gas temperature approaches wall temperature
-                if mass_flow <= 1e-6:
-                    tau = gas_mass * cp / (h_inner * area)
-                    dT_dt = (T_wall - temperatures[seg]) / tau
-                    new_temperatures[seg] = temperatures[seg] + dT_dt * dt
+                # No/low flow case - gas temperature equilibrates with walls
+                tau = gas_mass * cp / (h_inner * area + 1e-6)
+                dT_dt = (T_wall - temperatures[seg]) / tau
+                new_temperatures[seg] = temperatures[seg] + dT_dt * dt
             
             # Enforce physical bounds for all segments except inlet
             if seg > 0:

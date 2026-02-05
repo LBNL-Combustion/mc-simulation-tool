@@ -6,16 +6,161 @@ import matplotlib.pyplot as plt
 from dataclasses import dataclass
 from typing import List, Dict, Any, Optional
 from .physics import PhysicalProperties
-from .mass_flow import MassFlow
 from .comprehensive_heat_transfer import ComprehensiveHeatTransfer
 from .coupled_solver import CoupledFlowThermalSolver
 from .early_diagnostics import EarlyTimeDiagnostics
 from .chimney_geometry_plot import plot_chimney_geometry, plot_chimney_snapshot
+from .wind_cap_effects import WindCapConfig, wind_cap_deltaP
+from .flow.elbows import base_K
+import pandas as pd
+
+@dataclass
+class InletRestrictionConfig:
+    """Configuration for inlet flow restriction (door, damper, etc.)
+
+    Models restriction at system inlet based on door geometry and opening.
+    Supports two door types with different effective area calculations:
+
+    - **swivel** (hinged door): A_eff = A_door × sin(angle), angle = opening% × π/2
+    - **sliding** (slide door): A_eff = A_door × opening% (linear)
+
+    The restriction is modeled as a quadratic resistance in mass-flow space:
+        ΔP = R_door × ṁ²
+    where R_door = K_equiv / (2 × ρ × A_eff²)
+
+    This resistance is added to total_resistance in the momentum solver,
+    ensuring consistent pressure-flow relationships.
+
+    To avoid infinite resistance at A_eff→0, a minimum leakage area is added:
+        A_eff_used = A_eff_raw + A_leak
+    This provides finite resistance even when fully closed.
+
+    Dynamic Door Control:
+        Use door_opening_func parameter in Chimney to provide a function
+        that returns door opening percentage at any time t.
+
+    Attributes:
+        enable: Activate restriction feature
+        door_type: 'swivel' (hinged) or 'sliding' - affects A_eff calculation
+        door_opening_percent: How much door is open (0-100%)
+        door_width_ft: Door width in feet
+        door_height_ft: Door height in feet
+        door_cracked_percent: If set, enables simple dynamic door schedule
+        door_wide_open_time_s: How long door stays wide open (default 90s)
+        Cd: Discharge coefficient (default 0.62)
+        A_leak_m2: Minimum leakage area when closed (default 50 cm² = 0.005 m²)
+        max_effective_area_m2: Maximum effective area (caps at downstream restriction).
+            Set to pipe/tee area when door opens into restricted space. If None, no cap.
+            For 6" pipe: 0.0182 m² = 182 cm²
+        K_loss_override: Optional manual K-loss coefficient override
+
+        # Computed values (set automatically during initialization)
+        door_area_m2: Full door area computed from dimensions [m²]
+        A_eff_raw_m2: Raw effective area from geometry (before adding leakage)
+        effective_area_m2: Total effective area = A_eff_raw + A_leak
+        K_equiv: Equivalent loss coefficient = 1/Cd²
+    """
+    # User inputs
+    enable: bool = False
+    door_type: str = 'swivel'  # 'swivel' (hinged) or 'sliding'
+    door_opening_percent: float = 100.0  # 0-100%
+    door_width_ft: float = 1.0  # feet
+    door_height_ft: float = 1.0  # feet
+
+    # Dynamic door schedule (simple built-in schedule)
+    # For more control, use door_opening_func in Chimney instead
+    door_cracked_percent: Optional[float] = None
+    door_wide_open_time_s: float = 90.0
+
+    # Discharge coefficient for orifice model
+    Cd: float = 0.62
+
+    # Leakage area - minimum flow area when door is fully closed
+    # Default 0.005 m² = 50 cm² represents gaps around a closed door
+    A_leak_m2: float = 0.005
+
+    # Maximum effective area - caps A_eff at downstream restriction (tee/pipe)
+    # If None, no cap is applied (door geometry determines area)
+    # Set to pipe area (e.g., 0.0182 m² for 6" pipe) when door opens into restricted space
+    max_effective_area_m2: Optional[float] = None
+
+    # Optional override (if set, bypasses Cd calculation)
+    K_loss_override: Optional[float] = None
+
+    # Computed values (set during initialization)
+    door_area_m2: float = 0.0  # Full door area from dimensions [m²]
+    A_eff_raw_m2: float = 0.0  # Raw area from geometry
+    effective_area_m2: float = 0.0  # Total area = A_eff_raw + A_leak
+    K_equiv: float = 0.0  # = 1/Cd² unless K_loss_override is set
+
+
+@dataclass
+class CatalyticBypassConfig:
+    """Configuration for catalytic bypass damper
+
+    Models a bypass damper that allows flue gases to either:
+    - OPEN: Bypass the catalytic combustor (low resistance, startup mode)
+    - CLOSED: Flow through the catalyst honeycomb (higher resistance, steady burn)
+
+    Uses a simple variable resistance approach where the effective K-loss
+    changes based on bypass state.
+
+    Attributes:
+        enable: Activate bypass feature
+        bypass_state: 'open', 'closed', or float 0-100 (0=closed, 100=open)
+        segment_index: Which segment contains the catalyst (0-indexed)
+        K_bypass_open: K-loss coefficient when bypass is open (low, ~0.3-1.0)
+        K_catalyst_closed: K-loss coefficient through catalyst (~2-5 typical)
+
+        # Computed values (set automatically during initialization)
+        K_effective: The actual K-loss used based on bypass_state
+        bypass_fraction: 0.0 (closed) to 1.0 (open), computed from bypass_state
+    """
+    # User inputs
+    enable: bool = False
+    bypass_state: Any = 'open'  # 'open', 'closed', or 0-100 float
+    segment_index: int = 0  # Which segment has the catalyst
+    K_bypass_open: float = 0.5  # Low resistance when bypassing
+    K_catalyst_closed: float = 3.0  # Higher resistance through catalyst
+
+    # Computed values (set during initialization)
+    K_effective: float = 0.0
+    bypass_fraction: float = 1.0  # 0=closed (through catalyst), 1=open (bypass)
+
+@dataclass
+class LeakageConfig:
+    """Configuration for distributed pipe joint leakage
+
+    Models air infiltration/exfiltration through pipe joints (slip joints, seams).
+    Leakage flow depends on local gauge pressure:
+    - Positive P_gauge (above ambient) → gas leaks OUT
+    - Negative P_gauge (below ambient) → ambient air leaks IN
+
+    Uses VENT-II style orifice model:
+        m_leak = Cd × A_leak × sqrt(2 × rho × |ΔP|)
+
+    Leakage area is distributed across segments based on pipe type:
+    - Black stove pipe has slip joints → higher leakage
+    - Insulated pipe has sealed joints → lower leakage
+
+    Attributes:
+        enable: Activate leakage feature
+        total_leakage_area_cm2: Total leakage area in cm² (split between parts)
+        black_pipe_fraction: Fraction of leakage in black stove pipe (0-1)
+        insulated_fraction: Fraction of leakage in insulated pipe (0-1)
+        Cd_leak: Discharge coefficient for leaks (default 0.61)
+    """
+    enable: bool = False
+    total_leakage_area_cm2: float = 10.0  # Total leakage area in cm²
+    black_pipe_fraction: float = 0.6     # 60% of leakage in black pipe
+    insulated_fraction: float = 0.4      # 40% of leakage in insulated pipe
+    Cd_leak: float = 0.61                # Discharge coefficient for leaks
+
 
 @dataclass
 class ChimneyPart:
     """Configuration for a single or triple-wall chimney part
-    
+
     This class stores all the properties needed to define one section of the chimney.
     The chimney can be made up of multiple parts with different properties.
     """
@@ -70,6 +215,11 @@ class ChimneyPart:
     has_fittings: bool = False  # True if section has elbows/tees (increases pressure drop)
     roughness_m: float = 1e-6  # Surface roughness in meters - affects friction factor
     humidity_ratio: float = 0.01  # kg water / kg dry air - for condensation calculations
+
+    # CORRUGATION PROPERTIES (optional, for corrugated pipes)
+    # If None, pipe is treated as smooth with base roughness_m
+    # If dict provided, corrugation effects are computed and folded into equivalent roughness
+    corrugation: Optional[Dict[str, Any]] = None  # See SpiralCorrugationProperties for structure
     
     def __post_init__(self):
         """Convert units and validate inputs
@@ -114,6 +264,234 @@ class ChimneyPart:
         if self.height_m <= 0:
             raise ValueError("height must be positive")
 
+        # Process corrugation properties if provided
+        self._process_corrugation_properties()
+
+    def _process_corrugation_properties(self):
+        """Process corrugation properties and compute equivalent roughness
+
+        This preprocessing function handles:
+        1. Annular corrugations (existing code path)
+        2. Spiral corrugations (NEW - compute helix effects and fold seam losses)
+        3. None (smooth pipe with base roughness)
+
+        The corrugation effects are folded into self.roughness_m so that
+        existing solvers work without modification.
+        """
+        if self.corrugation is None:
+            # No corrugation - use base roughness as-is
+            # self.roughness_m already set from input or default
+            return
+
+        corr_type = self.corrugation.get('type', 'none').lower()
+
+        if corr_type == 'none':
+            # Explicitly no corrugation
+            return
+
+        elif corr_type == 'spiral':
+            # NEW: Spiral corrugation preprocessing
+            self._process_spiral_corrugation()
+
+        elif corr_type == 'annular':
+            # Annular corrugations - use existing model
+            self._process_annular_corrugation()
+
+        else:
+            raise ValueError(f"Unknown corrugation type: {corr_type}. "
+                           f"Must be 'none', 'spiral', or 'annular'")
+
+    def _process_spiral_corrugation(self):
+        """Process spiral corrugation and compute equivalent roughness
+
+        Converts spiral corrugation geometry into equivalent roughness that
+        captures both form drag and seam losses. This allows existing solvers
+        to work without modification.
+        """
+        from .corrugation_effects import (
+            SpiralCorrugationProperties,
+            compute_spiral_corrugation_effects
+        )
+
+        corr = self.corrugation
+
+        # Extract dimensions (convert mm to m)
+        depth_m = corr.get('depth_mm', 3.0) / 1000.0
+        pitch_m = corr.get('pitch_mm', 180.0) / 1000.0
+        num_starts = corr.get('num_starts', 1)
+        base_roughness_m = corr.get('base_roughness_mm', 0.001) / 1000.0
+
+        # Seam properties
+        has_lock_seam = corr.get('has_lock_seam', True)
+        seam_protrusion_m = corr.get('seam_protrusion_mm', 2.0) / 1000.0
+        seam_width_m = corr.get('seam_width_mm', 8.0) / 1000.0
+        K_seam = corr.get('K_seam_per_crossing', 0.05)
+        K_lock = corr.get('K_lock_seam', 0.03)
+
+        # Version 2.0: Swirl and heat transfer enhancement flags
+        enable_swirl = corr.get('enable_spiral_swirl', False)
+        swirl_friction_cap = corr.get('swirl_friction_cap', 0.15)
+        enable_HT = corr.get('enable_spiral_HT_enhancement', False)
+        HT_enhancement_cap = corr.get('HT_enhancement_cap', 0.25)
+
+        # Create SpiralCorrugationProperties object
+        spiral_props = SpiralCorrugationProperties(
+            depth_m=depth_m,
+            pitch_m=pitch_m,
+            num_starts=num_starts,
+            base_roughness_m=base_roughness_m,
+            has_lock_seam=has_lock_seam,
+            seam_protrusion_m=seam_protrusion_m,
+            seam_width_m=seam_width_m,
+            K_seam_per_crossing=K_seam,
+            K_lock_seam=K_lock
+        )
+
+        # Compute equivalent roughness using segment length
+        # Use average segment length for this part
+        segment_length = self.height_m / self.num_segments
+
+        # Compute effects
+        effects = compute_spiral_corrugation_effects(
+            diameter_m=self.inner_diameter_m,
+            length_m=segment_length,
+            spiral_props=spiral_props,
+            representative_Re=10000,  # Typical turbulent Re for flues
+            enable_swirl=enable_swirl,
+            swirl_friction_cap=swirl_friction_cap,
+            enable_HT=enable_HT,
+            HT_enhancement_cap=HT_enhancement_cap
+        )
+
+        # Store results for diagnostics
+        self.corrugation_effects = effects
+
+        # Update roughness to equivalent value that includes all effects
+        self.roughness_m = effects['equivalent_roughness_m']
+
+        # Print diagnostic information
+        version_str = " (v2.0)" if (enable_swirl or enable_HT) else ""
+        print(f"\n{'='*70}")
+        print(f"SPIRAL CORRUGATION PREPROCESSING{version_str} - Part with D={self.inner_diameter_m*1000:.1f}mm")
+        print(f"{'='*70}")
+        print(f"  Corrugation depth:        {depth_m*1000:.2f} mm")
+        print(f"  Helical pitch:            {pitch_m*1000:.1f} mm")
+        print(f"  Number of starts:         {num_starts}")
+        print(f"  Helix angle:              {effects['helix_angle_deg']:.1f}°")
+        print(f"  Swirl index S:            {effects['swirl_index']:.3f}")
+        print(f"  Spiral factor c_spiral:   {effects['spiral_factor']:.3f}")
+        print(f"  Base roughness:           {base_roughness_m*1e6:.2f} µm")
+        print(f"  Effective roughness:      {effects['effective_roughness_m']*1e6:.1f} µm")
+        print(f"  Seam crossings/segment:   {effects['n_seams']:.2f}")
+        print(f"  Total K from seams:       {effects['K_total_seams']:.4f}")
+        print(f"  Lock seam K:              {effects['K_lock_seam']:.4f}")
+
+        if enable_swirl:
+            print(f"  Swirl friction mult m_f:  {effects['friction_multiplier']:.3f} (enabled)")
+        else:
+            print(f"  Swirl friction mult m_f:  1.000 (disabled)")
+
+        if enable_HT:
+            print(f"  Heat transfer mult M_h:   {effects['Mh']:.3f} (enabled)")
+        else:
+            print(f"  Heat transfer mult M_h:   1.000 (disabled)")
+
+        print(f"  Equivalent roughness:     {effects['equivalent_roughness_m']*1e6:.1f} µm")
+        print(f"  Friction factor (base):   {effects['friction_factor_corrugation']:.5f}")
+        print(f"  Friction factor (final):  {effects['friction_factor_total']:.5f}")
+        print(f"{'='*70}\n")
+
+    def _process_annular_corrugation(self):
+        """Process annular corrugation using full physics model
+
+        Annular corrugations are perpendicular rings that create recirculation
+        and form drag. The model accounts for depth/pitch ratio, Reynolds effects,
+        and diameter scaling.
+        """
+        from .corrugation_effects import (
+            CorrugationProperties,
+            CorrugatedPipeFriction
+        )
+
+        corr = self.corrugation
+
+        # Extract properties (convert mm to m)
+        depth_m = corr.get('depth_mm', 3.0) / 1000.0
+        pitch_m = corr.get('pitch_mm', 25.0) / 1000.0
+        base_roughness_m = corr.get('base_roughness_mm', 0.001) / 1000.0
+
+        # Create CorrugationProperties object
+        corr_props = CorrugationProperties(
+            depth_m=depth_m,
+            pitch_m=pitch_m,
+            base_roughness_m=base_roughness_m
+        )
+
+        # Use full annular corrugation model
+        friction_calc = CorrugatedPipeFriction()
+
+        # Calculate corrugated friction factor at representative Re
+        representative_Re = 10000  # Typical turbulent Re for flues
+        f_corrugated = friction_calc.calculate_corrugated_friction_factor(
+            Re=representative_Re,
+            D=self.inner_diameter_m,
+            corrugation=corr_props
+        )
+
+        # Compute smooth pipe friction factor for comparison
+        f_smooth = friction_calc._colebrook_white(representative_Re, base_roughness_m / self.inner_diameter_m)
+
+        # Invert to find equivalent roughness that gives f_corrugated
+        # Use Newton-Raphson iteration
+        eps_eq = base_roughness_m  # Initial guess
+        for iteration in range(15):
+            f_current = friction_calc._colebrook_white(representative_Re, eps_eq / self.inner_diameter_m)
+
+            if abs(f_current - f_corrugated) < 1e-6:
+                break
+
+            # Numerical derivative
+            deps = eps_eq * 0.001 + 1e-9
+            f_perturbed = friction_calc._colebrook_white(representative_Re, (eps_eq + deps) / self.inner_diameter_m)
+            df_deps = (f_perturbed - f_current) / deps
+
+            if abs(df_deps) > 1e-12:
+                eps_eq = eps_eq + (f_corrugated - f_current) / df_deps
+
+            # Bounds
+            eps_eq = max(eps_eq, base_roughness_m)
+            eps_eq = min(eps_eq, self.inner_diameter_m * 0.05)
+
+        # Store results
+        self.roughness_m = eps_eq
+
+        # Store diagnostics
+        self.corrugation_effects = {
+            'type': 'annular',
+            'depth_m': depth_m,
+            'pitch_m': pitch_m,
+            'depth_to_pitch_ratio': corr_props.depth_to_pitch_ratio,
+            'base_roughness_m': base_roughness_m,
+            'equivalent_roughness_m': eps_eq,
+            'friction_factor_smooth': f_smooth,
+            'friction_factor_corrugated': f_corrugated,
+            'enhancement_factor': f_corrugated / f_smooth if f_smooth > 0 else 1.0
+        }
+
+        # Print diagnostic information
+        print(f"\n{'='*70}")
+        print(f"ANNULAR CORRUGATION PREPROCESSING - Part with D={self.inner_diameter_m*1000:.1f}mm")
+        print(f"{'='*70}")
+        print(f"  Corrugation depth:        {depth_m*1000:.2f} mm")
+        print(f"  Corrugation pitch:        {pitch_m*1000:.1f} mm")
+        print(f"  Depth/pitch ratio:        {corr_props.depth_to_pitch_ratio:.3f}")
+        print(f"  Base roughness:           {base_roughness_m*1e6:.2f} µm")
+        print(f"  Equivalent roughness:     {eps_eq*1e6:.1f} µm")
+        print(f"  Friction factor (smooth): {f_smooth:.5f}")
+        print(f"  Friction factor (corr):   {f_corrugated:.5f}")
+        print(f"  Enhancement factor:       {f_corrugated/f_smooth:.2f}x")
+        print(f"{'='*70}\n")
+
 class Chimney:
     """Main chimney simulation class
     
@@ -125,9 +503,19 @@ class Chimney:
     """
     
     def __init__(self, parts: List[Dict[str, Any]], dt: float = 0.5, total_time: float = 60.0,
-                 use_coupled_solver: bool = True):
+                 use_coupled_solver: bool = True, elbows: List[Dict[str, Any]] = None,
+                 elbow_method: str = "K_sum", top_boundary: Optional[Dict[str, Any]] = None,
+                 inlet_restriction: Optional[Dict[str, Any]] = None,
+                 catalytic_bypass: Optional[Dict[str, Any]] = None,
+                 door_opening_func: Optional[callable] = None,
+                 inlet_temp_csv: Optional[str] = None,
+                 inlet_temp_func: Optional[callable] = None,
+                 door_temp_dilution: Optional[Dict[str, Any]] = None,
+                 room_pressure_offset_Pa: float = 0.0,
+                 leakage_config: Optional[Dict[str, Any]] = None,
+                 verbose: bool = False):
         """Initialize chimney simulation
-        
+
         Args:
             parts: List of dictionaries defining chimney parts. Each dict contains
                    properties like 'type', 'inner_diameter_ft', 'height_ft', etc.
@@ -138,7 +526,44 @@ class Chimney:
             use_coupled_solver: If True, use iterative coupling between flow and thermal
                                equations for better accuracy. If False, use faster
                                sequential approach.
+            elbows: List of dictionaries defining elbows between parts. Each dict contains
+                   'between_segments', 'angle_deg', 'R_over_D', 'elbow_type', etc.
+            elbow_method: Method for calculating elbow losses: "K_sum" or "equivalent_length"
+            inlet_restriction: Optional dict with inlet restriction config:
+                   - enable: bool (activate feature)
+                   - door_width_ft: float (door width in feet)
+                   - door_height_ft: float (door height in feet)
+                   - door_cracked_percent: float (% open after loading, enables dynamic door)
+                   - door_wide_open_time_s: float (how long door stays open, default 90s)
+                   - door_opening_percent: float (0-100, for static mode only)
+                   - Cd: float (discharge coefficient, default 0.62)
+                   Example: {'enable': True, 'door_width_ft': 1.29, 'door_height_ft': 0.92,
+                            'door_cracked_percent': 10}  # 10% cracked after 90s
+            catalytic_bypass: Optional dict with catalytic bypass damper config:
+                   - enable: bool (activate feature)
+                   - bypass_state: 'open', 'closed', or 0-100 float (0=closed, 100=open)
+                   - segment_index: int (which segment has the catalyst, 0-indexed)
+                   - K_bypass_open: float (K-loss when bypass open, default 0.5)
+                   - K_catalyst_closed: float (K-loss through catalyst, default 3.0)
+            door_opening_func: (Advanced) Optional callable(t) -> float for custom door
+                   schedules. Most users should use door_cracked_percent instead.
+            inlet_temp_csv: Optional inlet temperature data from CSV. Can be:
+                   - String path: Uses default columns 'PC_Test Time [min]' (min) and 'Flue Temp' (°F)
+                   - Dict with custom config:
+                     {'path': 'file.csv', 'time_col': 'Time', 'temp_col': 'Temp',
+                      'time_unit': 'min' or 's', 'temp_unit': 'F', 'C', or 'K'}
+                   Linear interpolation is used between data points.
+                   If not provided, uses default exponential ramp-up model.
+            inlet_temp_func: Optional callable(t) -> T_K for inlet temperature.
+                   Takes time in seconds, returns temperature in Kelvin.
+                   This allows directly passing experimental data (e.g., TC1).
+                   If both inlet_temp_csv and inlet_temp_func are provided,
+                   inlet_temp_func takes precedence.
         """
+        self.inlet_temp_csv = inlet_temp_csv
+        self.inlet_temp_func = inlet_temp_func
+        self.inlet_temp_df = None
+        self.inlet_temp_interp = None  # Interpolation function for CSV data
         # Store simulation parameters
         self.dt = dt  # Time step size
         self.total_time = total_time  # How long to simulate
@@ -148,9 +573,19 @@ class Chimney:
         # This validates inputs and converts units
         self.parts = [ChimneyPart(**part) for part in parts]
         
+        # Store elbow configuration
+        self.elbows = elbows if elbows is not None else []
+        self.elbow_method = elbow_method
+        
+        # Process elbows and create ElbowSpec objects for each segment junction
+        self._process_elbows()
+        
         # Calculate total number of computational segments
         # Each part is divided into segments for numerical solution
         self.total_segments = sum(part.num_segments for part in self.parts)
+        
+        # Print sanity check summary of the geometry
+        self._print_geometry_summary()
         
         # Check for triple wall parts and warn if time step is large
         # Triple walls have thin metal layers that require small time steps
@@ -164,9 +599,74 @@ class Chimney:
         # Initialize physics modules
         # Each module handles a specific aspect of the physics
         self.physics = PhysicalProperties()  # Gas properties (density, viscosity, etc.)
-        self.mass_flow = MassFlow()  # Flow rate calculations
         self.comprehensive_ht = ComprehensiveHeatTransfer()  # Advanced heat transfer with all modes
-        
+
+        # Initialize wind cap boundary effect (optional)
+        self.top_boundary = top_boundary if top_boundary is not None else {}
+        self._wind_cfg = self._parse_wind_cap(self.top_boundary)
+        self._deltaP_wind_cap_static = None
+        self._last_deltaP_wind_cap = 0.0  # For diagnostics
+
+        # If static mode, compute once and cache
+        if self._wind_cfg.enable and self._wind_cfg.update_mode == "static":
+            V = self._wind_cfg.wind_speed_m_s
+            if isinstance(V, (list, tuple)):
+                V0 = float(V[0]) if len(V) > 0 else 0.0
+            else:
+                V0 = float(V)
+
+            Pa_outlet = self.parts[-1].Pa if len(self.parts) > 0 else 101325.0
+            self._deltaP_wind_cap_static = wind_cap_deltaP(
+                Pa=Pa_outlet,
+                T_out_K=self._wind_cfg.air_temp_K,
+                V_wind=V0,
+                cap_type=self._wind_cfg.cap_type,
+                exposure=self._wind_cfg.roof_exposure,
+                theta_deg=self._wind_cfg.wind_direction_deg,
+                gust_factor=self._wind_cfg.gust_factor,
+                Cp_override=self._wind_cfg.Cp_override,
+            )
+            self._last_deltaP_wind_cap = self._deltaP_wind_cap_static
+
+            # Print initialization diagnostic
+            if self._wind_cfg.enable:
+                sign_str = "suction" if self._deltaP_wind_cap_static < 0 else "pressurization"
+                effect_str = "aids draft" if self._deltaP_wind_cap_static < 0 else "hurts draft"
+                print(f"[WIND CAP] Static mode: V={V0:.1f} m/s, cap={self._wind_cfg.cap_type}, "
+                      f"ΔP={self._deltaP_wind_cap_static:+.2f} Pa ({sign_str}, {effect_str})")
+
+        # Initialize inlet restriction
+        self._initialize_inlet_restriction(inlet_restriction)
+
+        # Set up door opening function for dynamic door control
+        # Priority: explicit door_opening_func > door_cracked_percent > static
+        self.door_opening_func = door_opening_func
+
+        # If door_cracked_percent is set, create the built-in door schedule
+        if (self.inlet_restriction.enable and
+            self.inlet_restriction.door_cracked_percent is not None and
+            door_opening_func is None):
+            # Create the standard door schedule function
+            cracked_pct = self.inlet_restriction.door_cracked_percent
+            wide_open_time = self.inlet_restriction.door_wide_open_time_s
+
+            def _door_schedule(t, wide_open_time=wide_open_time, cracked_pct=cracked_pct):
+                """Built-in door schedule: wide open, then cracked"""
+                if t < wide_open_time:
+                    return 100.0  # Wide open during loading
+                else:
+                    return cracked_pct  # Cracked open for burn
+
+            self.door_opening_func = _door_schedule
+            print(f"[DOOR] Dynamic door schedule: 100% open for {wide_open_time:.0f}s, "
+                  f"then {cracked_pct:.0f}% cracked")
+
+        elif door_opening_func is not None and self.inlet_restriction.enable:
+            print(f"[DOOR] Custom door opening function enabled")
+
+        # Initialize catalytic bypass damper
+        self._initialize_catalytic_bypass(catalytic_bypass)
+
         # Initialize coupled solver if requested
         # Coupled solver iterates between flow and thermal equations for consistency
         self.use_coupled_solver = use_coupled_solver
@@ -177,6 +677,40 @@ class Chimney:
         # Initialize early diagnostics
         # This checks for numerical problems in the first few time steps
         self.diagnostics = EarlyTimeDiagnostics(ambient_temp_K=self.parts[0].T_ambient_K)
+
+        # Load inlet temperature from CSV if provided
+        if inlet_temp_csv is not None:
+            self._load_inlet_temp_csv(inlet_temp_csv)
+
+        # Initialize door temperature dilution (Jan 27 feature)
+        # When door is open, cold ambient air mixes with hot combustion gas
+        self.door_temp_dilution_enable = False
+        self.door_temp_dilution_strength = 0.8  # Default: 80% ambient at 100% door open
+        if door_temp_dilution is not None:
+            self.door_temp_dilution_enable = door_temp_dilution.get('enable', False)
+            self.door_temp_dilution_strength = door_temp_dilution.get('strength', 0.8)
+            if self.door_temp_dilution_enable:
+                print(f"[DOOR DILUTION] Enabled with strength={self.door_temp_dilution_strength:.2f}")
+
+        # Initialize leakage configuration (pipe joint air infiltration)
+        self._initialize_leakage_config(leakage_config)
+
+        # Update coupled solver momentum config based on leakage settings
+        if self.use_coupled_solver and hasattr(self, 'leakage_config') and self.leakage_config.enable:
+            self.coupled_solver.momentum_config.use_distributed_leakage = True
+
+        # Store verbose flag and room pressure offset
+        self.verbose = verbose
+        self.room_pressure_offset_Pa = room_pressure_offset_Pa
+
+        # Pre-compute segment lengths to avoid repeated division (performance optimization)
+        self.segment_lengths = np.zeros(self.total_segments)
+        seg_idx = 0
+        for part in self.parts:
+            seg_length = part.height_m / part.num_segments
+            for i in range(part.num_segments):
+                self.segment_lengths[seg_idx] = seg_length
+                seg_idx += 1
         
         # Initialize all the arrays to store results
         # This allocates memory for temperature, flow, pressure histories
@@ -185,6 +719,12 @@ class Chimney:
         # Simulation state tracking
         self.current_time = 0.0  # Current simulation time in seconds
         self.time_step = 0  # Current time step index
+
+        # Backdraft detection and tracking
+        self.backdraft_detected = False  # True if backdraft has occurred at any point
+        self.backdraft_start_time = None  # Time when backdraft first started (seconds)
+        self.backdraft_end_time = None  # Time when normal draft was restored (seconds)
+        self.flow_reversal_count = 0  # Number of times flow has reversed direction
     #Done
     def run_simulation(self, save_interval: int = 1):
         """Run the complete simulation using comprehensive heat transfer model
@@ -204,15 +744,30 @@ class Chimney:
             # Update simulation state
             self.time_step = step
             self.current_time = step * self.dt
-            
+
+            # STEP 0: UPDATE DOOR OPENING (if dynamic door control enabled)
+            # This updates effective area before physics calculations
+            if self.door_opening_func is not None and self.inlet_restriction.enable:
+                new_opening = self.door_opening_func(self.current_time)
+                old_opening = self.door_opening_history[step - 1]
+
+                # Detect significant change in door opening (threshold: 5%)
+                if abs(new_opening - old_opening) > 5.0:
+                    direction = "closing" if new_opening < old_opening else "opening"
+                    print(f"  [DOOR] t={self.current_time:.1f}s: Door {direction} "
+                          f"{old_opening:.0f}% -> {new_opening:.0f}%")
+
+                self._update_door_opening(new_opening)
+                self.door_opening_history[step] = new_opening
+            else:
+                # Static door - copy previous value
+                self.door_opening_history[step] = self.door_opening_history[step - 1]
+
             # STEP 1: CALCULATE INLET TEMPERATURE
             # This is the temperature of gas entering the bottom of the chimney
-            # It ramps up over time to simulate fire establishment
+            # Uses CSV data if provided, otherwise default exponential ramp-up
             T_ambient_inlet = self.parts[0].T_ambient_K
-            
-            # Note: Smooth ramp-up code is commented out but could be enabled
-            # to avoid numerical shock from sudden temperature change
-            T_inlet = self._default_inlet_temp(self.current_time, T_ambient=T_ambient_inlet)
+            T_inlet = self._get_inlet_temp(self.current_time, T_ambient=T_ambient_inlet)
             
             # STEP 2: SOLVE PHYSICS EQUATIONS
             if self.use_coupled_solver:
@@ -220,11 +775,12 @@ class Chimney:
                 # This ensures consistency between buoyancy (depends on T) and
                 # heat transfer (depends on flow). More accurate but slower.
                 metrics = self.coupled_solver.solve_coupled_timestep(self, step, T_inlet, self.dt)
-                self.convergence_history.append(metrics)
+                # Don't store convergence history to save memory (uncomment if needed for debugging)
+                # self.convergence_history.append(metrics)
                 
-                # Warn if iteration didn't converge (but continue anyway)
-                if step % max(1, self.time_steps // 20) == 0 and not metrics.converged:
-                    print(f"  Warning: Coupling did not converge at t={self.current_time:.1f}s")
+                # Warn if iteration didn't converge (but continue anyway) - disabled for speed
+                # if step % max(1, self.time_steps // 20) == 0 and not metrics.converged:
+                #     print(f"  Warning: Coupling did not converge at t={self.current_time:.1f}s")
             else:
                 # SEQUENTIAL APPROACH: First heat transfer, then flow
                 # Faster but less accurate since T and flow aren't fully consistent
@@ -234,7 +790,35 @@ class Chimney:
                 
                 # Update flow based on new temperatures (buoyancy)
                 self._update_flow_and_pressure(step)
-            
+
+            # BACKDRAFT DETECTION: Track flow direction changes
+            # This monitors for flow reversal (backdraft) events
+            if step > 1:  # Need at least 2 timesteps to detect change
+                current_flow = self.mass_flow_rate[step]
+                previous_flow = self.mass_flow_rate[step - 1]
+
+                # Detect transition from normal draft to backdraft
+                if previous_flow >= 0 and current_flow < 0:
+                    self.backdraft_detected = True
+                    self.backdraft_start_time = self.current_time
+                    self.flow_reversal_count += 1
+                    print(f"\n{'='*60}")
+                    print(f"[BACKDRAFT DETECTED] Flow reversal at t={self.current_time:.1f}s")
+                    print(f"  Mass flow: {previous_flow:.4f} → {current_flow:.4f} kg/s")
+                    print(f"  Flow direction: UPWARD → DOWNWARD (backdraft)")
+                    print(f"{'='*60}\n")
+
+                # Detect transition from backdraft to normal draft (recovery)
+                elif previous_flow < 0 and current_flow >= 0:
+                    self.backdraft_end_time = self.current_time
+                    duration = self.backdraft_end_time - (self.backdraft_start_time or 0)
+                    print(f"\n{'='*60}")
+                    print(f"[DRAFT RESTORED] Normal flow resumed at t={self.current_time:.1f}s")
+                    print(f"  Mass flow: {previous_flow:.4f} → {current_flow:.4f} kg/s")
+                    print(f"  Flow direction: DOWNWARD → UPWARD (normal draft)")
+                    print(f"  Backdraft duration: {duration:.1f}s")
+                    print(f"{'='*60}\n")
+
             # STEP 3: DIAGNOSTICS AND STABILITY CHECKS
             # Check for unphysical behavior in early timesteps when transients are strong
             if step <= 30:  # First 30 timesteps are most prone to instability
@@ -252,18 +836,40 @@ class Chimney:
                 )
             
             # STEP 4: PROGRESS REPORTING
-            # Print status every 10% of simulation (less frequent for speed)
-            if step % max(1, self.time_steps // 10) == 0:
+            # Print status every 5% of simulation to show it's running
+            if step % max(1, self.time_steps // 20) == 0:
                 progress = 100 * step / self.time_steps
                 gas_temp_range = (self.T_gas[step].min() - 273.15, self.T_gas[step].max() - 273.15)
                 wall_temp_range = (self.T_wall[step].min() - 273.15, self.T_wall[step].max() - 273.15)
                 print(f"  {progress:5.1f}% | t={self.current_time:6.1f}s | Gas: {gas_temp_range[0]:5.1f}-{gas_temp_range[1]:5.1f}°C | Wall: {wall_temp_range[0]:5.1f}-{wall_temp_range[1]:5.1f}°C")
+
+                # Wind cap diagnostic (if enabled and in dynamic mode)
+                if self._wind_cfg.enable and self._wind_cfg.update_mode == "dynamic":
+                    dP = self._last_deltaP_wind_cap
+                    V = self._wind_cfg.wind_speed_m_s
+                    if isinstance(V, (list, tuple)):
+                        V_current = V[min(step, len(V) - 1)]
+                    else:
+                        V_current = V
+                    sign_str = "suction" if dP < 0 else "pressurization"
+                    print(f"  [WIND CAP] V={V_current:.1f} m/s, cap={self._wind_cfg.cap_type}, ΔP={dP:+.2f} Pa ({sign_str})")
                 
         print("Comprehensive simulation completed successfully")
         
         # Run conservation diagnostics
         self.check_conservation()
     #Done
+    def _inlet_constant_no_heat(self,T_ambient=293.15):
+        return T_ambient
+    def _inlet_temp_special(self,t):
+        """
+        Approximate top-of-chimney temperature [°C]
+        given time t [s] since ignition.
+        """
+        if self.inlet_temp_df is None:
+            self.inlet_temp_df=pd.read_csv('./resources/actual_flue_temp.csv')
+        
+        return self.inlet_temp_df[self.inlet_temp_df['t_s']==t]['Flue Temp 1'].values[0] + 50 + 273.15
     def _default_inlet_temp(self, t, T_ambient=293.15, T_max=773.15, tau=300):
         """
         Models the inlet gas temperature entering the chimney as a function of time.
@@ -334,8 +940,8 @@ class Chimney:
             # Get info about which part this segment belongs to
             part_idx, local_seg, part = self.get_segment_info(seg)
             
-            # Length of this computational segment
-            segment_length = part.height_m / part.num_segments
+            # Length of this computational segment (use pre-computed value)
+            segment_length = self.segment_lengths[seg]
             
             # INLET CONDITION FOR THIS SEGMENT
             if seg > 0:
@@ -343,11 +949,11 @@ class Chimney:
                 # Temperature is continuous (no sudden jumps)
                 self.T_gas[step, seg] = self.T_gas[step, seg-1]
                 
-                # Debug output for transition between different wall types
-                if seg == 5 and step == self.time_steps:  # Example: first segment of second part
-                    print(f"DEBUG Gas flow from single to triple wall:")
-                    print(f"  Single wall final segment gas temp: {self.T_gas[step, seg-1] - 273.15:.1f}°C")
-                    print(f"  Triple wall first segment gas temp: {self.T_gas[step, seg] - 273.15:.1f}°C")
+                # Debug output disabled for performance
+                # if seg == 5 and step == self.time_steps:
+                #     print(f"DEBUG Gas flow from single to triple wall:")
+                #     print(f"  Single wall final segment gas temp: {self.T_gas[step, seg-1] - 273.15:.1f}°C")
+                #     print(f"  Triple wall first segment gas temp: {self.T_gas[step, seg] - 273.15:.1f}°C")
                 
             # Estimate velocity for this segment
             if step == 1:
@@ -372,6 +978,18 @@ class Chimney:
                 'mass_flow_rate': self.mass_flow_rate[step-1] if step > 0 else 0.01  # Flow rate
             }
             
+            # Add elbow specifications if present at this segment junction
+            elbow_key = (part_idx, local_seg)
+            if hasattr(self, 'segment_elbows') and elbow_key in self.segment_elbows:
+                segment_data['elbows'] = self.segment_elbows[elbow_key]
+                segment_data['elbow_method'] = self.elbow_method
+
+            # Add corrugation information and heat transfer multiplier (v2.0)
+            if hasattr(part, 'corrugation') and part.corrugation is not None:
+                segment_data['corrugation'] = part.corrugation
+                if hasattr(part, 'corrugation_effects') and 'Mh' in part.corrugation_effects:
+                    segment_data['Mh'] = part.corrugation_effects['Mh']
+
             # Add wall-specific data based on configuration
             if part.type == 'single':
                 # Get previous wall temperature 
@@ -403,11 +1021,7 @@ class Chimney:
                     prev_T_liner = part.T_ambient_K
                     prev_T_middle = part.T_ambient_K
                     prev_T_outer = part.T_ambient_K
-                
-                # Debug: show what we're reading
-                if step <= 3 and seg <= 2:
-                    print(f"DEBUG: Step {step}, seg {seg} - reading prev temps: liner={prev_T_liner-273.15:.1f}°C, middle={prev_T_middle-273.15:.1f}°C, outer={prev_T_outer-273.15:.1f}°C")
-                    
+
                 segment_data.update({
                     'liner_temperature': prev_T_liner,
                     'middle_temperature': prev_T_middle,
@@ -442,19 +1056,9 @@ class Chimney:
             results = self.comprehensive_ht.calculate_segment_heat_transfer(segment_data, self.dt)
             
             # Debug heat transfer coefficients and temperatures
-            if step == self.time_steps:  # Only debug final step
-                print(f"DEBUG Segment {seg+1} (Part {part_idx+1} {part.type.title()} Wall):")
-                print(f"  Gas temp in: {self.T_gas[step, seg] - 273.15:.1f}°C")
-                print(f"  h_inner: {results['h_inner']:.1f} W/(m²·K)")
-                print(f"  h_outer: {results['h_outer']:.1f} W/(m²·K)")
-                
-                if part.type == 'triple':
-                    if 'liner_temperature_new' in results:
-                        print(f"  Liner temp out: {results['liner_temperature_new'] - 273.15:.1f}°C")
-                        print(f"  Middle temp out: {results['middle_temperature_new'] - 273.15:.1f}°C")
-                        print(f"  Outer temp out: {results['outer_temperature_new'] - 273.15:.1f}°C")
-                else:
-                    print(f"  Wall temp out: {results['wall_temperature_new'] - 273.15:.1f}°C")
+            # Debug disabled for performance
+            # if step == self.time_steps:
+            #     print(f"DEBUG Segment {seg+1} (Part {part_idx+1} {part.type.title()} Wall):")
             
             # Validate results
             if 'wall_temperature_new' not in results and 'liner_temperature_new' not in results:
@@ -492,8 +1096,9 @@ class Chimney:
                     T_outer_new = part.T_ambient_K
                     
                 # Debug: show what we're storing
-                if step <= 3 and seg <= 2:
-                    print(f"DEBUG: Step {step}, seg {seg} - storing new temps: liner={T_liner_new-273.15:.1f}°C, middle={T_middle_new-273.15:.1f}°C, outer={T_outer_new-273.15:.1f}°C")
+                # Debug disabled for performance
+                # if step <= 3 and seg <= 2:
+                #     print(f"DEBUG: Step {step}, seg {seg} - storing new temps: liner={T_liner_new-273.15:.1f}°C, middle={T_middle_new-273.15:.1f}°C, outer={T_outer_new-273.15:.1f}°C")
                     
                 self.T_liner[step, seg] = T_liner_new
                 self.T_middle[step, seg] = T_middle_new
@@ -617,26 +1222,27 @@ class Chimney:
             total_pressure_loss += dp_loss_seg
         
         # STEP 3: SOLVE FOR MASS FLOW RATE
-        # Balance equation: Buoyancy pressure - Friction losses = Net pressure
-        net_pressure = total_buoyancy - total_pressure_loss
-        
-        if net_pressure > 0:
-            # Positive net pressure drives upward flow
-            # Use Bernoulli equation simplified: dp = K * rho * v^2 / 2
-            # Solving for velocity: v = sqrt(2 * dp / (K * rho))
-            avg_density = np.mean(self.density[step, :])  # Average gas density
-            flow_coefficient = 1.0  # Simplified - could include discharge coefficient
-            velocity_avg = np.sqrt(2 * abs(net_pressure) / (flow_coefficient * avg_density))
-            
-            # Mass flow rate = density * velocity * area
-            avg_area = np.mean([part.inner_area_m2 for part in self.parts])
+        # Balance equation: Buoyancy pressure - Friction losses - Room depressurization = Net pressure
+        # Room depressurization reduces available draft and can cause backdraft
+        net_pressure = total_buoyancy - total_pressure_loss - self.room_pressure_offset_Pa
+
+        # Calculate mass flow from net pressure (allows backdraft)
+        avg_density = np.mean(self.density[step, :])  # Average gas density
+        flow_coefficient = 1.0  # Simplified - could include discharge coefficient
+        avg_area = np.mean([part.inner_area_m2 for part in self.parts])
+
+        # Use Bernoulli equation: dp = K * rho * v^2 / 2
+        # Solving for velocity: v = sqrt(2 * |dp| / (K * rho))
+        velocity_avg = np.sqrt(2 * abs(net_pressure) / (flow_coefficient * avg_density + 1e-10))
+
+        # Mass flow rate = density * velocity * area
+        # Sign matches net_pressure: positive = upward draft, negative = backdraft
+        if net_pressure >= 0:
             self.mass_flow_rate[step] = avg_density * velocity_avg * avg_area
         else:
-            # No buoyancy (or negative) means no natural draft
-            # This happens when:
-            # 1. Gas has cooled to ambient temperature
-            # 2. Friction losses exceed buoyancy forces
-            self.mass_flow_rate[step] = 0.0
+            # BACKDRAFT: Negative net pressure drives downward flow
+            # This happens when room depressurization exceeds available draft
+            self.mass_flow_rate[step] = -avg_density * velocity_avg * avg_area
         
         # STEP 4: UPDATE VELOCITIES IN EACH SEGMENT
         # Velocity varies with diameter and density changes
@@ -807,6 +1413,244 @@ class Chimney:
         if initial_water > 0:
             error_pct = 100 * abs(water_removed - total_condensed) / initial_water
             print(f"  Mass balance closure: {100 - error_pct:.1f}%")
+    def _process_elbows(self):
+        """Process elbow definitions and map them to segments."""
+        from .flow.elbows import ElbowSpec
+        
+        # Create a mapping of segment boundaries to elbows
+        self.segment_elbows = {}  # key: (part_idx, local_seg_idx), value: List[ElbowSpec]
+        
+        # Validate geometry consistency
+        n_parts = len(self.parts)
+        # Maximum fittings = n_parts - 1 (between parts) + 1 (inlet fitting before part 0)
+        max_fittings = n_parts  # Allow inlet fitting + all junctions between parts
+
+        if len(self.elbows) > max_fittings:
+            raise ValueError(
+                f"Geometry error: {len(self.elbows)} fittings specified but only "
+                f"{max_fittings} locations exist ({n_parts} parts allow 1 inlet + {n_parts-1} junctions). "
+                f"Each fitting must be at inlet (-1,0) or between two adjacent parts."
+            )
+        
+        # Track which junctions have been used
+        used_junctions = set()
+        
+        for i, elbow_dict in enumerate(self.elbows):
+            # Extract elbow location - accept both 'between_segments' and 'between_parts'
+            between = elbow_dict.get('between_segments', elbow_dict.get('between_parts', []))
+            if len(between) != 2:
+                raise ValueError(
+                    f"Elbow {i} missing or invalid 'between_segments'/'between_parts' specification. "
+                    f"Expected [from_part, to_part], got {between}"
+                )
+                
+            part_from, part_to = between[0], between[1]
+
+            # Handle special case: part_from == -1 means inlet fitting (before part 0)
+            is_inlet_fitting = (part_from == -1 and part_to == 0)
+
+            # Validate part indices
+            if not is_inlet_fitting and part_from >= n_parts:
+                raise ValueError(
+                    f"Elbow {i}: Invalid 'from' part index {part_from}. "
+                    f"Only {n_parts} parts exist (indices 0-{n_parts-1})"
+                )
+
+            if part_to >= n_parts:
+                raise ValueError(
+                    f"Elbow {i}: Invalid 'to' part index {part_to}. "
+                    f"Only {n_parts} parts exist (indices 0-{n_parts-1})"
+                )
+
+            # Check for adjacent parts (skip for inlet fitting)
+            if not is_inlet_fitting and abs(part_to - part_from) != 1:
+                raise ValueError(
+                    f"Elbow {i}: Parts {part_from} and {part_to} are not adjacent. "
+                    f"Elbows can only connect adjacent parts."
+                )
+
+            # Check for duplicate junction specification
+            junction = (min(part_from, part_to), max(part_from, part_to))
+            if junction in used_junctions:
+                raise ValueError(
+                    f"Elbow {i}: Junction between parts {part_from} and {part_to} "
+                    f"already has an elbow defined. Each junction can have only one elbow."
+                )
+            used_junctions.add(junction)
+
+            # Validate geometric compatibility (skip for inlet fitting)
+            if not is_inlet_fitting and part_from >= 0 and part_from < n_parts and part_to < n_parts:
+                # Check if orientations make sense for an elbow
+                orient_from = self.parts[part_from].orientation
+                orient_to = self.parts[part_to].orientation
+
+                # Warn about unusual configurations
+                if orient_from == orient_to == "horizontal":
+                    print(f"Warning: Elbow {i} connects two horizontal sections. "
+                          f"Ensure the angle_deg reflects the actual geometry.")
+
+                # Check diameter compatibility
+                diam_from = self.parts[part_from].inner_diameter_m
+                diam_to = self.parts[part_to].inner_diameter_m
+
+                if abs(diam_from - diam_to) / min(diam_from, diam_to) > 0.1:
+                    print(f"Warning: Elbow {i} connects parts with >10% diameter difference "
+                          f"({diam_from*1000:.1f}mm to {diam_to*1000:.1f}mm). "
+                          f"Consider adding a reducer/expander.")
+
+            # Get diameter from the appropriate part
+            if is_inlet_fitting:
+                diameter = self.parts[0].inner_diameter_m  # Use first part for inlet
+            else:
+                diameter = self.parts[part_from].inner_diameter_m
+
+            # Handle tee special case: auto-set to 90° if not specified
+            # Accept both 'elbow_type' and 'type' keys for compatibility
+            elbow_type = elbow_dict.get('elbow_type', elbow_dict.get('type', 'long_radius'))
+            if elbow_type == 'tee':
+                # Tees are treated as 90° branch flow
+                angle_deg = elbow_dict.get('angle_deg', 90)
+                R_over_D = 1.0  # Fixed for tees
+            else:
+                angle_deg = elbow_dict.get('angle_deg', 90)
+                R_over_D = elbow_dict.get('R_over_D', 1.5)
+
+            # Create ElbowSpec object
+            elbow_spec = ElbowSpec(
+                angle_deg=angle_deg,
+                diameter_m=diameter,
+                R_over_D=R_over_D,
+                elbow_type=elbow_type,
+                smoothness=elbow_dict.get('smoothness', 'commercial_steel'),
+                vane_factor=elbow_dict.get('vane_factor', 1.0),
+                K_override=elbow_dict.get('K_override', None),
+                Le_override_m=elbow_dict.get('Le_override_m', None)
+            )
+            
+            # Store the elbow at the junction between parts
+            # For inlet fitting (part_from == -1), store at first segment of part 0
+            # Otherwise, associate with the last segment of the upstream part
+            if is_inlet_fitting:
+                key = (0, 0)  # First segment of first part
+            else:
+                last_seg_idx = self.parts[part_from].num_segments - 1
+                key = (part_from, last_seg_idx)
+
+            if key not in self.segment_elbows:
+                self.segment_elbows[key] = []
+            self.segment_elbows[key].append(elbow_spec)
+            
+            # Print confirmation (removed - will print summary instead)
+    
+    def _print_geometry_summary(self):
+        """Print a sanity check summary of the chimney geometry."""
+        print("\n" + "="*70)
+        print("CHIMNEY GEOMETRY SUMMARY (Sanity Check)")
+        print("="*70)
+        
+        # Build a list of all components in order
+        components = []
+        total_height = 0.0
+        total_length = 0.0
+        
+        # Convert feet/inches for display if values suggest imperial units
+        def format_length(meters):
+            """Format length with both metric and imperial units."""
+            feet = meters / 0.3048
+            inches = meters / 0.0254
+            if feet > 0.5:  # Show feet for longer sections
+                return f"{meters:.2f}m ({feet:.1f}ft)"
+            else:  # Show inches for short sections
+                return f"{meters*1000:.0f}mm ({inches:.1f}in)"
+        
+        def format_diameter(meters):
+            """Format diameter with both metric and imperial units."""
+            mm = meters * 1000
+            inches = meters / 0.0254
+            return f"{mm:.1f}mm ({inches:.1f}in)"
+        
+        # Check for inlet fitting at (0, 0) - before Part 0
+        if hasattr(self, 'segment_elbows') and (0, 0) in self.segment_elbows:
+            for elbow in self.segment_elbows[(0, 0)]:
+                elbow_desc = f"INLET: {elbow.angle_deg:.0f}° {elbow.elbow_type.replace('_', '-')}"
+                elbow_desc += f" (R/D={elbow.R_over_D:.1f})"
+                components.append(elbow_desc)
+
+        # Process each part and its associated elbows
+        for i, part in enumerate(self.parts):
+            # Add the part info
+            length_str = format_length(part.height_m)
+            diam_str = format_diameter(part.inner_diameter_m)
+
+            part_desc = f"Part {i}: {part.type.upper()} {part.orientation}"
+            part_desc += f", L={length_str}, D={diam_str}"
+
+            if part.type == 'triple':
+                part_desc += " (triple-wall)"
+
+            components.append(part_desc)
+
+            # Track total dimensions
+            if part.orientation == 'vertical':
+                total_height += part.height_m
+            total_length += part.height_m
+
+            # Check for elbow after this part (at last segment)
+            elbow_key = (i, part.num_segments - 1)
+            if hasattr(self, 'segment_elbows') and elbow_key in self.segment_elbows:
+                for elbow in self.segment_elbows[elbow_key]:
+                    elbow_desc = f"       └─ FITTING: {elbow.angle_deg:.0f}°"
+                    elbow_desc += f" {elbow.elbow_type.replace('_', '-')}"
+                    elbow_desc += f" (R/D={elbow.R_over_D:.1f})"
+                    if elbow.vane_factor < 1.0:
+                        elbow_desc += f" with vanes (factor={elbow.vane_factor:.1f})"
+                    components.append(elbow_desc)
+        
+        # Print the component list
+        print("\nFlow path from inlet to outlet:")
+        print("-" * 40)
+        for comp in components:
+            print(comp)
+        
+        # Print summary statistics
+        # Count registered fittings (elbows/tees) from segment_elbows
+        total_fittings = sum(len(v) for v in self.segment_elbows.values()) if hasattr(self, 'segment_elbows') else 0
+        print("\n" + "-" * 40)
+        print("Summary:")
+        print(f"  Total parts: {len(self.parts)}")
+        print(f"  Total fittings (elbows/tees): {total_fittings}")
+        print(f"  Total path length: {format_length(total_length)}")
+        print(f"  Total vertical rise: {format_length(total_height)}")
+        print(f"  Computational segments: {self.total_segments}")
+        print(f"  Elbow loss method: {self.elbow_method}")
+        
+        # Check for common issues
+        warnings = []
+        
+        # Check if all parts have same diameter
+        diameters = [p.inner_diameter_m for p in self.parts]
+        if len(set(diameters)) > 1:
+            warnings.append("Parts have different diameters - check for proper transitions")
+        
+        # Check for reasonable number of segments
+        avg_segments = self.total_segments / len(self.parts)
+        if avg_segments < 2:
+            warnings.append("Low segment count - consider increasing for better accuracy")
+        elif avg_segments > 20:
+            warnings.append("High segment count - may increase computation time")
+        
+        # Check elbow-to-part ratio
+        if len(self.elbows) > len(self.parts):
+            warnings.append("More elbows than parts - verify configuration")
+        
+        # Print warnings if any
+        if warnings:
+            print("\nWarnings:")
+            for warning in warnings:
+                print(f"  ⚠ {warning}")
+        
+        print("="*70)
+    
     #Done
     def _initialize_arrays(self):
         """Initialize arrays for storing simulation results
@@ -838,7 +1682,14 @@ class Chimney:
         # Heat transfer coefficients
         self.h_conv_inner = np.zeros((self.time_steps + 1, self.total_segments))  # W/(m²·K)
         self.h_conv_outer = np.zeros((self.time_steps + 1, self.total_segments))  # W/(m²·K)
-        
+
+        # Door opening history (for dynamic door control)
+        # Stores opening percentage (0-100) at each timestep
+        self.door_opening_history = np.zeros(self.time_steps + 1)
+        # Initialize with current opening percent (or 100 if no restriction)
+        initial_opening = self.inlet_restriction.door_opening_percent if self.inlet_restriction.enable else 100.0
+        self.door_opening_history[0] = initial_opening
+
         # Time array
         self.time_array = np.linspace(0, self.total_time, self.time_steps + 1)
         
@@ -861,7 +1712,13 @@ class Chimney:
             for seg in range(start_seg, end_seg):
                 if seg == 0:
                     # Bottom segment gets hot inlet air
-                    initial_gas_temp = part.T_ambient_K + 10.0  # Small initial rise
+                    # Use inlet_temp_func or CSV at t=0 if available (initial conditions fix)
+                    if self.inlet_temp_func is not None:
+                        initial_gas_temp = float(self.inlet_temp_func(0.0))
+                    elif self.inlet_temp_interp is not None:
+                        initial_gas_temp = float(self.inlet_temp_interp(0.0))
+                    else:
+                        initial_gas_temp = part.T_ambient_K + 10.0  # Small initial rise
                 else:
                     # All other segments start at ambient (cold)
                     # They will be heated by the hot gas flowing through
@@ -920,7 +1777,750 @@ class Chimney:
             current_seg += part.num_segments
         raise IndexError(f"Segment index {segment_idx} out of range")
 
-    
+    def _parse_wind_cap(self, tb: dict) -> WindCapConfig:
+        """Parse top_boundary dict into WindCapConfig"""
+        return WindCapConfig(
+            enable=bool(tb.get("enable_wind_cap_effect", False)),
+            wind_speed_m_s=tb.get("wind_speed_m_s", 0.0),
+            wind_direction_deg=tb.get("wind_direction_deg", 0.0),
+            air_temp_K=tb.get("air_temp_K", 294.15),
+            cap_type=tb.get("cap_type", "open"),
+            roof_exposure=tb.get("roof_exposure", "open"),
+            orientation=tb.get("orientation", "vertical"),
+            gust_factor=tb.get("gust_factor", 1.0),
+            Cp_override=tb.get("Cp_override", None),
+            update_mode=tb.get("wind_cap_update", "dynamic"),
+        )
+
+    def _initialize_inlet_restriction(self, inlet_restriction: Optional[Dict[str, Any]]):
+        """Process and validate inlet restriction configuration
+
+        Converts door geometry (opening %, area) to effective flow area.
+        The restriction is modeled as a quadratic resistance in mdot-space:
+            R_door = K_equiv / (2 × ρ × A_eff²)
+        This resistance is added to total_resistance in the momentum solver.
+
+        Supports two door types:
+        - SWIVEL (hinged): A_eff = A_door × sin(θ), where θ = opening% × π/2
+        - SLIDING: A_eff = A_door × opening%
+
+        Minimum leakage area ensures finite resistance when door is closed:
+            A_eff_used = A_eff_raw + A_leak
+
+        Args:
+            inlet_restriction: Dict with restriction parameters or None
+        """
+        import math
+
+        # Create config object
+        if inlet_restriction is None:
+            self.inlet_restriction = InletRestrictionConfig()
+            return
+
+        if isinstance(inlet_restriction, dict):
+            self.inlet_restriction = InletRestrictionConfig(**inlet_restriction)
+        else:
+            self.inlet_restriction = inlet_restriction
+
+        # Early return if disabled
+        if not self.inlet_restriction.enable:
+            return
+
+        # --- VALIDATION ---
+
+        # Check door opening percent bounds
+        if not (0.0 <= self.inlet_restriction.door_opening_percent <= 100.0):
+            raise ValueError(
+                f"door_opening_percent must be between 0 and 100, "
+                f"got {self.inlet_restriction.door_opening_percent}"
+            )
+
+        # Check door dimensions are positive
+        if self.inlet_restriction.door_width_ft <= 0:
+            raise ValueError(
+                f"door_width_ft must be positive, got {self.inlet_restriction.door_width_ft}"
+            )
+        if self.inlet_restriction.door_height_ft <= 0:
+            raise ValueError(
+                f"door_height_ft must be positive, got {self.inlet_restriction.door_height_ft}"
+            )
+
+        # Calculate door area from dimensions (convert feet to meters)
+        FT_TO_M = 0.3048
+        door_width_m = self.inlet_restriction.door_width_ft * FT_TO_M
+        door_height_m = self.inlet_restriction.door_height_ft * FT_TO_M
+        self.inlet_restriction.door_area_m2 = door_width_m * door_height_m
+
+        # Validate discharge coefficient
+        if self.inlet_restriction.Cd <= 0 or self.inlet_restriction.Cd > 1.0:
+            raise ValueError(
+                f"Cd must be in range (0, 1.0], got {self.inlet_restriction.Cd}"
+            )
+
+        # Validate leakage area
+        if self.inlet_restriction.A_leak_m2 <= 0:
+            raise ValueError(
+                f"A_leak_m2 must be positive, got {self.inlet_restriction.A_leak_m2}"
+            )
+
+        # Validate K_loss override if provided
+        if self.inlet_restriction.K_loss_override is not None:
+            if self.inlet_restriction.K_loss_override < 0:
+                raise ValueError("K_loss_override cannot be negative")
+            if self.inlet_restriction.K_loss_override > 100:
+                print("WARNING: Very large K_loss (>100) may cause numerical issues")
+
+        # --- VALIDATE DOOR TYPE ---
+        door_type = self.inlet_restriction.door_type.lower()
+        if door_type not in ('swivel', 'sliding'):
+            raise ValueError(
+                f"door_type must be 'swivel' or 'sliding', got '{self.inlet_restriction.door_type}'"
+            )
+
+        # --- CALCULATE EFFECTIVE AREA ---
+        # Two door types with different geometry:
+        #
+        # SWIVEL (hinged) door:
+        #   - Opens by rotating around hinge
+        #   - At 100% open = 90 degrees from closed
+        #   - A_eff = A_door × sin(angle), angle = opening% × π/2
+        #
+        # SLIDING door:
+        #   - Slides open linearly
+        #   - A_eff = A_door × opening% (linear relationship)
+
+        opening_pct = self.inlet_restriction.door_opening_percent
+        full_door_area = self.inlet_restriction.door_area_m2
+
+        if door_type == 'swivel':
+            # Swivel door: A_eff = A_door × sin(θ), θ = opening% × π/2
+            angle_rad = (opening_pct / 100.0) * (math.pi / 2.0)
+            A_eff_raw = full_door_area * math.sin(angle_rad)
+        else:  # sliding
+            # Sliding door: A_eff = A_door × (opening% / 100)
+            A_eff_raw = full_door_area * (opening_pct / 100.0)
+
+        self.inlet_restriction.A_eff_raw_m2 = A_eff_raw
+
+        # --- ADD MINIMUM LEAKAGE AREA ---
+        # When door is fully closed, there's still some leakage through gaps.
+        # A_eff_used = A_eff_raw + A_leak
+        # This ensures finite resistance even when door is closed (opening% = 0).
+        A_leak = self.inlet_restriction.A_leak_m2
+        A_eff_used = A_eff_raw + A_leak
+
+        # --- CAP AT MAXIMUM EFFECTIVE AREA ---
+        # Even when door is wide open, flow is limited by downstream restriction
+        # (tee opening, pipe area). Cap effective area at this maximum.
+        max_area = self.inlet_restriction.max_effective_area_m2
+        if max_area is not None and A_eff_used > max_area:
+            A_eff_used = max_area
+            print(f"  [Note: A_eff capped at max_effective_area = {max_area*1e4:.0f} cm²]")
+
+        self.inlet_restriction.effective_area_m2 = A_eff_used
+
+        # Get inlet pipe geometry (for reference only)
+        inlet_part = self.parts[0]
+        inlet_pipe_area = inlet_part.inner_area_m2
+
+        # --- CALCULATE K_equiv FROM DISCHARGE COEFFICIENT ---
+        # K_equiv = 1/Cd² (used in resistance formula)
+        if self.inlet_restriction.K_loss_override is not None:
+            # User override takes precedence
+            self.inlet_restriction.K_equiv = self.inlet_restriction.K_loss_override
+        else:
+            # K_equiv = 1/Cd²
+            Cd = self.inlet_restriction.Cd
+            self.inlet_restriction.K_equiv = 1.0 / (Cd ** 2)
+
+        # --- PRINT SUMMARY ---
+
+        area_ratio = A_eff_used / inlet_pipe_area
+
+        # Calculate example R_door for reference (at inlet density ≈ 1.2 kg/m³)
+        rho_ref = 1.2  # kg/m³ (typical inlet)
+        K = self.inlet_restriction.K_equiv
+        R_door_ref = K / (2 * rho_ref * A_eff_used**2)
+
+        # Convert areas to sq inches for display
+        M2_TO_SQIN = 1550.0031  # 1 m² = 1550 sq in
+        door_area_sqin = full_door_area * M2_TO_SQIN
+        A_eff_raw_sqin = A_eff_raw * M2_TO_SQIN
+        A_eff_used_sqin = A_eff_used * M2_TO_SQIN
+
+        print("\n" + "="*70)
+        print("INLET RESTRICTION CONFIGURATION")
+        print("="*70)
+        print(f"Status: ENABLED")
+        print(f"")
+        print(f"Door Configuration ({door_type}):")
+        print(f"  Dimensions:         {self.inlet_restriction.door_width_ft:.2f} ft × {self.inlet_restriction.door_height_ft:.2f} ft")
+        print(f"  Full door area:     {door_area_sqin:.1f} sq in ({full_door_area:.5f} m²)")
+        print(f"  Opening:            {self.inlet_restriction.door_opening_percent:.1f}%")
+        print(f"  Discharge coeff:    Cd = {self.inlet_restriction.Cd:.2f}")
+        print(f"  Leakage area:       {A_leak * M2_TO_SQIN:.2f} sq in (min area when closed)")
+        print(f"")
+        if door_type == 'swivel':
+            print(f"Swivel Door Geometry:")
+            angle_deg = (opening_pct / 100.0) * 90.0
+            angle_rad = (opening_pct / 100.0) * (math.pi / 2.0)
+            print(f"  Opening angle:      {angle_deg:.1f}°")
+            print(f"  sin(angle):         {math.sin(angle_rad):.4f}")
+        else:
+            print(f"Sliding Door Geometry:")
+            print(f"  Opening fraction:   {opening_pct/100:.2f}")
+        print(f"")
+        print(f"Calculated Values:")
+        print(f"  A_eff_raw (geom):   {A_eff_raw_sqin:.2f} sq in ({A_eff_raw:.5f} m²)")
+        print(f"  A_eff_used (total): {A_eff_used_sqin:.2f} sq in ({A_eff_used:.5f} m²)")
+        print(f"  Inlet pipe area:    {inlet_pipe_area * M2_TO_SQIN:.2f} sq in (reference)")
+        print(f"  Area ratio:         {area_ratio:.3f} ({area_ratio*100:.1f}% of pipe)")
+        print(f"  K_equiv (=1/Cd²):   {self.inlet_restriction.K_equiv:.3f} "
+              f"{'(from Cd)' if self.inlet_restriction.K_loss_override is None else '(manual override)'}")
+        print(f"")
+        print(f"Resistance Model (added to total_resistance):")
+        print(f"  R_door = K / (2 × ρ × A_eff²)")
+        print(f"  R_door ≈ {R_door_ref:.2f} Pa·s²/kg² (at ρ={rho_ref} kg/m³)")
+        print(f"  ΔP_door = R_door × ṁ²")
+        print("="*70 + "\n")
+
+    def _update_door_opening(self, opening_percent: float):
+        """Update inlet restriction effective area for a new door opening percentage
+
+        This method recalculates the effective flow area when door opening changes.
+        Used by dynamic door control (door_opening_func) during simulation.
+
+        The calculation mirrors _initialize_inlet_restriction but only updates
+        the opening-dependent values (A_eff_raw, effective_area_m2).
+
+        Args:
+            opening_percent: New door opening percentage (0-100)
+        """
+        import math
+
+        if not self.inlet_restriction.enable:
+            return
+
+        # Validate opening percent
+        opening_percent = max(0.0, min(100.0, opening_percent))
+
+        # Store new opening percent
+        self.inlet_restriction.door_opening_percent = opening_percent
+
+        # Recalculate effective area based on door type
+        full_door_area = self.inlet_restriction.door_area_m2
+        door_type = self.inlet_restriction.door_type.lower()
+
+        if door_type == 'swivel':
+            # Swivel door: A_eff = A_door × sin(θ), θ = opening% × π/2
+            angle_rad = (opening_percent / 100.0) * (math.pi / 2.0)
+            A_eff_raw = full_door_area * math.sin(angle_rad)
+        else:  # sliding
+            # Sliding door: A_eff = A_door × (opening% / 100)
+            A_eff_raw = full_door_area * (opening_percent / 100.0)
+
+        self.inlet_restriction.A_eff_raw_m2 = A_eff_raw
+
+        # Add minimum leakage area: A_eff_used = A_eff_raw + A_leak
+        A_leak = self.inlet_restriction.A_leak_m2
+        A_eff_used = A_eff_raw + A_leak
+
+        # Cap at maximum effective area (e.g., tee/pipe opening)
+        max_area = self.inlet_restriction.max_effective_area_m2
+        if max_area is not None and A_eff_used > max_area:
+            A_eff_used = max_area
+
+        self.inlet_restriction.effective_area_m2 = A_eff_used
+
+    def _load_inlet_temp_csv(self, csv_config):
+        """Load inlet temperature data from CSV and create interpolation function
+
+        Reads a CSV file with time and temperature columns, then creates an
+        interpolation function that returns temperature for any time value.
+        Linear interpolation is used between data points.
+
+        Args:
+            csv_config: Either a string path to CSV, or a dict with:
+                - 'path': Path to CSV file (required)
+                - 'time_col': Column name for time (default: 'PC_Test Time [min]')
+                - 'temp_col': Column name for temperature (default: 'Flue Temp')
+                - 'time_unit': 'min' or 's' (default: 'min')
+                - 'temp_unit': 'F', 'C', or 'K' (default: 'F')
+        """
+        from scipy import interpolate
+
+        # Parse config - can be string path or dict
+        if isinstance(csv_config, str):
+            csv_path = csv_config
+            time_col = 'PC_Test Time [min]'
+            temp_col = 'Flue Temp'
+            time_unit = 'min'
+            temp_unit = 'F'
+        else:
+            csv_path = csv_config.get('path')
+            time_col = csv_config.get('time_col', 'PC_Test Time [min]')
+            temp_col = csv_config.get('temp_col', 'Flue Temp')
+            time_unit = csv_config.get('time_unit', 'min')
+            temp_unit = csv_config.get('temp_unit', 'F')
+
+        try:
+            # Read CSV file
+            df = pd.read_csv(csv_path)
+            self.inlet_temp_df = df
+
+            # Check for required columns
+            if time_col not in df.columns:
+                raise ValueError(f"CSV must have column '{time_col}'. Found: {list(df.columns)}")
+            if temp_col not in df.columns:
+                raise ValueError(f"CSV must have column '{temp_col}'. Found: {list(df.columns)}")
+
+            # Extract and clean data
+            time_raw = df[time_col].values
+            temp_raw = df[temp_col].values
+
+            # Remove any NaN values
+            valid_mask = ~(np.isnan(time_raw) | np.isnan(temp_raw))
+            time_raw = time_raw[valid_mask]
+            temp_raw = temp_raw[valid_mask]
+
+            if len(time_raw) < 2:
+                raise ValueError("CSV must have at least 2 valid data points")
+
+            # Convert time to seconds
+            if time_unit == 'min':
+                time_sec = time_raw * 60.0
+            elif time_unit == 's':
+                time_sec = time_raw
+            else:
+                raise ValueError(f"Unknown time_unit: {time_unit}. Use 'min' or 's'")
+
+            # Convert temperature to Kelvin
+            if temp_unit == 'F':
+                # T_K = (T_F - 32) * 5/9 + 273.15
+                temp_K = (temp_raw - 32) * 5.0 / 9.0 + 273.15
+                temp_display_unit = '°F'
+            elif temp_unit == 'C':
+                temp_K = temp_raw + 273.15
+                temp_display_unit = '°C'
+            elif temp_unit == 'K':
+                temp_K = temp_raw
+                temp_display_unit = 'K'
+            else:
+                raise ValueError(f"Unknown temp_unit: {temp_unit}. Use 'F', 'C', or 'K'")
+
+            # Create linear interpolation function
+            # fill_value='extrapolate' allows values outside the data range
+            self.inlet_temp_interp = interpolate.interp1d(
+                time_sec, temp_K,
+                kind='linear',
+                fill_value='extrapolate',
+                bounds_error=False
+            )
+
+            # Print summary
+            time_min_display = time_sec / 60.0
+            print(f"\n" + "="*70)
+            print("INLET TEMPERATURE FROM CSV")
+            print("="*70)
+            print(f"File: {csv_path}")
+            print(f"Columns: time='{time_col}' ({time_unit}), temp='{temp_col}' ({temp_unit})")
+            print(f"Data points: {len(time_raw)}")
+            print(f"Time range: {time_min_display[0]:.1f} - {time_min_display[-1]:.1f} min "
+                  f"({time_sec[0]:.0f} - {time_sec[-1]:.0f} s)")
+            print(f"Temp range: {temp_raw.min():.0f} - {temp_raw.max():.0f} {temp_display_unit} "
+                  f"({temp_K.min():.0f} - {temp_K.max():.0f} K)")
+
+            # Check data granularity
+            time_diffs = np.diff(time_sec)
+            avg_interval = np.mean(time_diffs)
+            min_interval = np.min(time_diffs)
+            print(f"Data interval: avg={avg_interval:.1f}s, min={min_interval:.1f}s")
+
+            if avg_interval > self.dt:
+                print(f"Note: CSV data interval ({avg_interval:.1f}s) > simulation dt ({self.dt}s)")
+                print(f"      Linear interpolation will be used between data points")
+
+            print("="*70 + "\n")
+
+        except FileNotFoundError:
+            raise FileNotFoundError(f"Inlet temperature CSV not found: {csv_path}")
+        except Exception as e:
+            raise RuntimeError(f"Error loading inlet temperature CSV: {e}")
+
+    def _get_inlet_temp(self, t_sec: float, T_ambient: float = 293.15) -> float:
+        """Get inlet temperature at a given time
+
+        Priority order:
+        1. inlet_temp_func (callable) - if provided
+        2. inlet_temp_interp (from CSV) - if CSV was loaded
+        3. Default exponential ramp-up model
+
+        Applies door temperature dilution if enabled.
+
+        Args:
+            t_sec: Time in seconds
+            T_ambient: Ambient temperature in Kelvin (used by default model)
+
+        Returns:
+            Inlet temperature in Kelvin
+        """
+        if self.inlet_temp_func is not None:
+            # Use user-provided function (e.g., from experimental TC1 data)
+            T_inlet = float(self.inlet_temp_func(t_sec))
+        elif self.inlet_temp_interp is not None:
+            # Use CSV interpolated data
+            T_inlet = float(self.inlet_temp_interp(t_sec))
+        else:
+            # Use default exponential ramp-up model
+            T_inlet = self._default_inlet_temp(t_sec, T_ambient=T_ambient)
+
+        # Apply door temperature dilution (Jan 27 feature)
+        # When door is open, cold ambient air mixes with hot combustion gas
+        if self.door_temp_dilution_enable and self.door_opening_func is not None:
+            door_pct = self.door_opening_func(t_sec)
+            # Dilution fraction: at 100% open with strength=0.8, inlet is 80% ambient + 20% combustion
+            dilution_frac = min(max((door_pct / 100.0) * self.door_temp_dilution_strength, 0.0), 1.0)
+            T_inlet = T_inlet * (1.0 - dilution_frac) + T_ambient * dilution_frac
+
+        return T_inlet
+
+    def _initialize_catalytic_bypass(self, catalytic_bypass: Optional[Dict[str, Any]]):
+        """Process and validate catalytic bypass damper configuration
+
+        Converts dict input to CatalyticBypassConfig dataclass,
+        validates parameters, calculates effective K-loss based on bypass state,
+        and prints summary if enabled.
+
+        Args:
+            catalytic_bypass: Dict with bypass parameters or None
+        """
+        # Create config object
+        if catalytic_bypass is None:
+            self.catalytic_bypass = CatalyticBypassConfig()
+            return
+
+        if isinstance(catalytic_bypass, dict):
+            self.catalytic_bypass = CatalyticBypassConfig(**catalytic_bypass)
+        else:
+            self.catalytic_bypass = catalytic_bypass
+
+        # Early return if disabled
+        if not self.catalytic_bypass.enable:
+            return
+
+        # --- VALIDATION ---
+
+        # Check segment_index is valid
+        if not (0 <= self.catalytic_bypass.segment_index < self.total_segments):
+            raise ValueError(
+                f"segment_index must be between 0 and {self.total_segments - 1}, "
+                f"got {self.catalytic_bypass.segment_index}"
+            )
+
+        # Validate K values
+        if self.catalytic_bypass.K_bypass_open < 0:
+            raise ValueError(
+                f"K_bypass_open must be non-negative, got {self.catalytic_bypass.K_bypass_open}"
+            )
+
+        if self.catalytic_bypass.K_catalyst_closed < 0:
+            raise ValueError(
+                f"K_catalyst_closed must be non-negative, got {self.catalytic_bypass.K_catalyst_closed}"
+            )
+
+        # Validate and convert bypass_state to bypass_fraction (0-1)
+        state = self.catalytic_bypass.bypass_state
+
+        if isinstance(state, str):
+            state_lower = state.lower()
+            if state_lower == 'open':
+                self.catalytic_bypass.bypass_fraction = 1.0
+            elif state_lower == 'closed':
+                self.catalytic_bypass.bypass_fraction = 0.0
+            else:
+                raise ValueError(
+                    f"bypass_state must be 'open', 'closed', or a number 0-100, "
+                    f"got '{state}'"
+                )
+        elif isinstance(state, (int, float)):
+            # Numeric value: 0 = closed (through catalyst), 100 = open (bypass)
+            if not (0 <= state <= 100):
+                raise ValueError(
+                    f"bypass_state as number must be between 0 and 100, got {state}"
+                )
+            self.catalytic_bypass.bypass_fraction = state / 100.0
+        else:
+            raise ValueError(
+                f"bypass_state must be 'open', 'closed', or a number 0-100, "
+                f"got {type(state).__name__}"
+            )
+
+        # --- CALCULATE EFFECTIVE K-LOSS ---
+
+        # Linear interpolation between closed (catalyst) and open (bypass)
+        # K_effective = K_closed + bypass_fraction * (K_open - K_closed)
+        # When closed (bypass_fraction=0): K_effective = K_catalyst_closed
+        # When open (bypass_fraction=1): K_effective = K_bypass_open
+        K_open = self.catalytic_bypass.K_bypass_open
+        K_closed = self.catalytic_bypass.K_catalyst_closed
+
+        self.catalytic_bypass.K_effective = (
+            K_closed + self.catalytic_bypass.bypass_fraction * (K_open - K_closed)
+        )
+
+        # --- PRINT SUMMARY ---
+
+        print("\n" + "="*70)
+        print("CATALYTIC BYPASS DAMPER CONFIGURATION")
+        print("="*70)
+        print(f"Status: ENABLED")
+        print(f"")
+        print(f"Bypass Configuration:")
+
+        # Display state nicely
+        if self.catalytic_bypass.bypass_fraction == 1.0:
+            state_str = "OPEN (bypass active, gases bypass catalyst)"
+        elif self.catalytic_bypass.bypass_fraction == 0.0:
+            state_str = "CLOSED (gases flow through catalyst)"
+        else:
+            state_str = f"{self.catalytic_bypass.bypass_fraction*100:.0f}% open (partial bypass)"
+
+        print(f"  State:              {state_str}")
+        print(f"  Segment index:      {self.catalytic_bypass.segment_index}")
+        print(f"")
+        print(f"K-Loss Coefficients:")
+        print(f"  K when open:        {K_open:.3f} (low resistance, bypass)")
+        print(f"  K when closed:      {K_closed:.3f} (through catalyst)")
+        print(f"  K effective:        {self.catalytic_bypass.K_effective:.3f}")
+        print("="*70 + "\n")
+
+    def _initialize_leakage_config(self, leakage_config: Optional[Dict[str, Any]]):
+        """Process and validate leakage configuration for pipe joints
+
+        Distributes total leakage area across segments based on pipe type.
+        Black stove pipe has slip joints → higher leakage fraction.
+        Insulated pipe has sealed joints → lower leakage fraction.
+
+        Leakage flow at each segment is calculated using VENT-II style orifice model:
+            m_leak = Cd × A_leak × sqrt(2 × rho × |ΔP|)
+
+        Args:
+            leakage_config: Dict with leakage parameters or None
+        """
+        # Create config object
+        if leakage_config is None:
+            self.leakage_config = LeakageConfig()
+            self.segment_leakage_area_m2 = np.zeros(self.total_segments)
+            return
+
+        if isinstance(leakage_config, dict):
+            self.leakage_config = LeakageConfig(**leakage_config)
+        else:
+            self.leakage_config = leakage_config
+
+        # Early return if disabled
+        if not self.leakage_config.enable:
+            self.segment_leakage_area_m2 = np.zeros(self.total_segments)
+            return
+
+        # --- VALIDATION ---
+
+        if self.leakage_config.total_leakage_area_cm2 < 0:
+            raise ValueError(
+                f"total_leakage_area_cm2 must be non-negative, "
+                f"got {self.leakage_config.total_leakage_area_cm2}"
+            )
+
+        total_frac = self.leakage_config.black_pipe_fraction + self.leakage_config.insulated_fraction
+        if abs(total_frac - 1.0) > 0.01:
+            raise ValueError(
+                f"black_pipe_fraction + insulated_fraction must equal 1.0, "
+                f"got {total_frac:.2f}"
+            )
+
+        if not (0.0 < self.leakage_config.Cd_leak <= 1.0):
+            raise ValueError(
+                f"Cd_leak must be in range (0, 1.0], got {self.leakage_config.Cd_leak}"
+            )
+
+        # --- DISTRIBUTE LEAKAGE AREA ACROSS SEGMENTS ---
+
+        # Convert total area to m²
+        total_area_m2 = self.leakage_config.total_leakage_area_cm2 * 1e-4
+
+        # Count segments by pipe type (single = black stove pipe, triple = insulated)
+        black_pipe_segs = []
+        insulated_segs = []
+
+        seg_idx = 0
+        for part_idx, part in enumerate(self.parts):
+            for local_seg in range(part.num_segments):
+                if part.type == 'single':
+                    black_pipe_segs.append(seg_idx)
+                else:
+                    insulated_segs.append(seg_idx)
+                seg_idx += 1
+
+        # Distribute area proportionally
+        self.segment_leakage_area_m2 = np.zeros(self.total_segments)
+
+        black_pipe_area = total_area_m2 * self.leakage_config.black_pipe_fraction
+        insulated_area = total_area_m2 * self.leakage_config.insulated_fraction
+
+        if len(black_pipe_segs) > 0:
+            area_per_seg = black_pipe_area / len(black_pipe_segs)
+            for seg in black_pipe_segs:
+                self.segment_leakage_area_m2[seg] = area_per_seg
+
+        if len(insulated_segs) > 0:
+            area_per_seg = insulated_area / len(insulated_segs)
+            for seg in insulated_segs:
+                self.segment_leakage_area_m2[seg] = area_per_seg
+
+        # --- PRINT SUMMARY ---
+
+        print("\n" + "="*70)
+        print("LEAKAGE CONFIGURATION")
+        print("="*70)
+        print(f"Status: ENABLED")
+        print(f"")
+        print(f"Total leakage area: {self.leakage_config.total_leakage_area_cm2:.1f} cm² "
+              f"({total_area_m2*1e4:.1f} cm²)")
+        print(f"Discharge coeff:    Cd = {self.leakage_config.Cd_leak:.2f}")
+        print(f"")
+        print(f"Distribution:")
+        print(f"  Black stove pipe: {self.leakage_config.black_pipe_fraction*100:.0f}% "
+              f"({len(black_pipe_segs)} segments, {black_pipe_area*1e4:.1f} cm² total)")
+        print(f"  Insulated pipe:   {self.leakage_config.insulated_fraction*100:.0f}% "
+              f"({len(insulated_segs)} segments, {insulated_area*1e4:.1f} cm² total)")
+        print("="*70 + "\n")
+
+    def get_wind_cap_deltaP(self, step_index: int, Pa: float, T_out_K: float) -> float:
+        """
+        Get wind-induced pressure at chimney cap for a given timestep
+
+        Args:
+            step_index: Current simulation timestep index
+            Pa: Ambient pressure at outlet (Pa)
+            T_out_K: Ambient air temperature at outlet (K)
+
+        Returns:
+            Wind pressure effect ΔP_wind (Pa)
+            Negative = suction (aids draft), Positive = pressurization (hurts draft)
+        """
+        cfg = self._wind_cfg
+        if not cfg.enable:
+            return 0.0
+
+        # Static mode — return cached value
+        if cfg.update_mode == "static" and self._deltaP_wind_cap_static is not None:
+            return self._deltaP_wind_cap_static
+
+        # Dynamic mode — compute per-step wind
+        V = cfg.wind_speed_m_s
+        if isinstance(V, (list, tuple)):
+            idx = max(0, min(step_index, len(V) - 1))
+            Vt = float(V[idx])
+        else:
+            Vt = float(V)
+
+        dP = wind_cap_deltaP(
+            Pa=Pa,
+            T_out_K=T_out_K,
+            V_wind=Vt,
+            cap_type=cfg.cap_type,
+            exposure=cfg.roof_exposure,
+            theta_deg=cfg.wind_direction_deg,
+            gust_factor=cfg.gust_factor,
+            Cp_override=cfg.Cp_override,
+        )
+        self._last_deltaP_wind_cap = dP  # Store for diagnostics
+        return dP
+
+    #following functions needs to be added to docs
+    def plot_gas_temperatures_only(self,name=None):
+        """Plot only gas temperatures for each segment over time"""
+        fig, ax = plt.subplots(figsize=(12, 6))
+
+        # Create color map for segments
+        n_segments = self.total_segments
+        colors = plt.cm.coolwarm(np.linspace(0, 1, n_segments))
+
+        current_seg = 0
+        for part_idx, part in enumerate(self.parts):
+            for local_seg in range(part.num_segments):
+                global_seg = current_seg + local_seg
+
+                # Plot gas temperature for this segment
+                gas_temp_C = self.T_gas[:, global_seg] - 273.15
+
+                label = f'Part {part_idx+1}, Seg {local_seg+1}'
+                ax.plot(self.time_array / 60,  # Convert to minutes
+                        gas_temp_C,
+                        color=colors[global_seg],
+                        label=label,
+                        linewidth=1.5)
+
+            current_seg += part.num_segments
+
+        # Format plot
+        ax.set_xlabel('Time (minutes)', fontsize=12)
+        ax.set_ylabel('Gas Temperature (°C)', fontsize=12)
+        ax.set_title('Flue Gas Temperature Evolution by Segment', fontsize=14)
+        ax.grid(True, alpha=0.3)
+        ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=9)
+
+        plt.tight_layout()
+        if name: 
+            plt.savefig(name)
+        plt.show()
+
+    def plot_draft_simple(self,name=None):
+        """Simple plot of total draft over time"""
+        fig, ax = plt.subplots(figsize=(10, 5))
+
+        time_min = self.time_array / 60
+
+        # Calculate total draft at each timestep
+        draft = np.zeros(len(self.time_array))
+
+        for t in range(len(self.time_array)):
+            total_draft = 0
+            for part_idx, part in enumerate(self.parts):
+                if part.orientation.lower() == 'vertical':
+                    # Get segments for this part
+                    start_seg = sum(p.num_segments for p in self.parts[:part_idx])
+                    end_seg = start_seg + part.num_segments
+
+                    for seg in range(start_seg, end_seg):
+                        # Draft = g * h * (ρ_ambient - ρ_gas)
+                        seg_height = part.height_m / part.num_segments
+                        rho_ambient = self.physics.air_density(part.T_ambient_K, part.Pa)
+                        rho_gas = self.density[t, seg]
+
+                        total_draft += 9.81 * seg_height * (rho_ambient - rho_gas)
+
+            draft[t] = total_draft
+
+        # Plot
+        ax.plot(time_min, draft, 'b-', linewidth=2)
+        ax.fill_between(time_min, 0, draft, alpha=0.3)
+
+        # Add final value annotation
+        ax.axhline(draft[-1], color='r', linestyle='--', alpha=0.5)
+        ax.text(time_min[-1]*0.98, draft[-1], f'{draft[-1]:.1f} Pa',
+                ha='right', va='bottom', fontsize=10)
+
+        ax.set_xlabel('Time (minutes)', fontsize=12)
+        ax.set_ylabel('Draft Pressure (Pa)', fontsize=12)
+        ax.set_title('Chimney Draft Development Over Time', fontsize=14)
+        ax.grid(True, alpha=0.3)
+        ax.set_xlim(0, time_min[-1])
+
+        plt.tight_layout()
+        if name: 
+            plt.savefig(name)
+        plt.show()
     #plotting/Analyzing
     #Done
     def plot_temperature_profiles(self, times_to_plot: Optional[List[float]] = None):
@@ -1139,12 +2739,7 @@ class Chimney:
                     outer_temps = np.mean(self.T_outer[:, current_seg:end_seg], axis=1)
                     
                     # Debug: Check temperature values
-                    print(f"DEBUG Part {part_idx+1} Triple Wall:")
-                    print(f"  Final Liner temp: {liner_temps[-1] - 273.15:.1f}°C")
-                    print(f"  Final Middle temp: {np.mean(self.T_middle[-1, current_seg:end_seg]) - 273.15:.1f}°C")
-                    print(f"  Final Outer temp: {outer_temps[-1] - 273.15:.1f}°C")
-                    print(f"  Ambient temp: {part.T_ambient_K - 273.15:.1f}°C")
-                    
+
                     # Avoid division by zero
                     denominator = liner_temps - part.T_ambient_K
                     denominator = np.where(np.abs(denominator) < 1.0, 1.0, denominator)  # Avoid very small denominators
@@ -1333,8 +2928,11 @@ Wall: {np.max(self.T_wall) - 273.15:.1f}"""
         
         # First plot the inlet temperature in black
         T_ambient_inlet = self.parts[0].T_ambient_K
-        inlet_temps = np.array([self._default_inlet_temp(t, T_ambient=T_ambient_inlet) 
-                               for t in self.time_array]) - 273.15
+        
+        # Get inlet temperatures (uses CSV if available, otherwise default model)
+        inlet_temps = np.array([self._get_inlet_temp(t, T_ambient=T_ambient_inlet)
+                                for t in self.time_array]) - 273.15
+
         ax.plot(time_minutes, inlet_temps, 
                 label='Inlet Gas', color='black', linestyle='-', linewidth=3.5, zorder=10)
         
@@ -1440,11 +3038,14 @@ Wall: {np.max(self.T_wall) - 273.15:.1f}"""
         
         # First plot the inlet temperature in black
         T_ambient_inlet = self.parts[0].T_ambient_K
-        inlet_temps = np.array([self._default_inlet_temp(t, T_ambient=T_ambient_inlet) 
-                               for t in self.time_array]) - 273.15
-        ax.plot(time_minutes, inlet_temps, 
+
+        # Get inlet temperatures (uses CSV if available, otherwise default model)
+        inlet_temps = np.array([self._get_inlet_temp(t, T_ambient=T_ambient_inlet)
+                                 for t in self.time_array]) - 273.15
+
+        ax.plot(time_minutes, inlet_temps,
                 label='Inlet Gas', color='black', linestyle='-', linewidth=3.5, zorder=10)
-        
+
         # Get color maps for different temperature types
         n_parts = len(self.parts)
         color_intensities = np.linspace(0.3, 0.9, n_parts)
@@ -1679,66 +3280,84 @@ Wall: {np.max(self.T_wall) - 273.15:.1f}"""
         plt.show()
     #Done
     def plot_buoyancy_pressure(self):
-        """Plot total buoyancy pressure over time with detailed analysis"""
-        fig, ax = plt.subplots(1, 1, figsize=(14, 4))
-        
+        """Plot total buoyancy pressure and mass flow rate over time with detailed analysis"""
+        fig, ax1 = plt.subplots(1, 1, figsize=(14, 5))
+
         # Convert time to minutes
         time_minutes = self.time_array / 60.0
-        
+
         # Calculate total buoyancy pressure and per-part contributions
         total_buoyancy = np.zeros(self.time_steps + 1)
         part_buoyancy = np.zeros((self.time_steps + 1, len(self.parts)))
-        
+
         for step in range(self.time_steps + 1):
             current_seg = 0
-            
+
             for part_idx, part in enumerate(self.parts):
                 end_seg = current_seg + part.num_segments
                 part_buoyancy_sum = 0.0
-                
+
                 for seg in range(current_seg, end_seg):
                     segment_length = part.height_m / part.num_segments
-                    
+
                     # Only vertical segments contribute to buoyancy
                     if part.orientation.lower() == 'vertical':
                         rho_gas = self.density[step, seg]
                         rho_ambient = self.physics.air_density(part.T_ambient_K, part.Pa)
-                        
+
                         # Buoyancy pressure: g * height * (rho_ambient - rho_gas)
                         dp_buoyancy = 9.81 * segment_length * (rho_ambient - rho_gas)
                         part_buoyancy_sum += dp_buoyancy
-                
+
                 part_buoyancy[step, part_idx] = part_buoyancy_sum
                 total_buoyancy[step] += part_buoyancy_sum
                 current_seg = end_seg
-        
-        # Plot total buoyancy
-        ax.plot(time_minutes, total_buoyancy, 'k-', linewidth=3.5, 
+
+        # Plot total buoyancy on primary axis
+        line1, = ax1.plot(time_minutes, total_buoyancy, 'k-', linewidth=3.5,
                 label='Total Buoyancy', zorder=10)
-        
+
         # Plot per-part contributions
         n_parts = len(self.parts)
         color_intensities = np.linspace(0.4, 0.9, n_parts)
-        
+
         for part_idx, part in enumerate(self.parts):
             if part.orientation.lower() == 'vertical':
                 color = plt.cm.Blues(color_intensities[part_idx])
                 height_ft = round(part.height_ft,2)
-                ax.plot(time_minutes, part_buoyancy[:, part_idx], 
-                       label=f'Part {part_idx+1} ({height_ft} ft, {part.orientation})', 
+                ax1.plot(time_minutes, part_buoyancy[:, part_idx],
+                       label=f'Part {part_idx+1} ({height_ft} ft, {part.orientation})',
                        color=color, linestyle='--', linewidth=2, alpha=0.8)
-        
+
         # Add zero reference line
-        ax.axhline(y=0, color='gray', linestyle=':', alpha=0.5, linewidth=1.5)
-        
-        # Format axes
-        ax.set_xlabel('Time (minutes)', fontsize=16)
-        ax.set_ylabel('Buoyancy Pressure (Pa)', fontsize=16)
-        ax.set_title('Buoyancy Pressure Development', fontsize=20)
-        ax.tick_params(axis='both', which='major', labelsize=14)
-        ax.grid(True, alpha=0.3)
-        ax.legend(fontsize=12, loc='best')
-        
+        ax1.axhline(y=0, color='gray', linestyle=':', alpha=0.5, linewidth=1.5)
+
+        # Format primary axis (buoyancy)
+        ax1.set_xlabel('Time (min)', fontsize=16)
+        ax1.set_ylabel('Buoyancy pressure (Pa)', fontsize=16, color='black')
+        ax1.tick_params(axis='both', which='major', labelsize=14)
+        ax1.tick_params(axis='y', labelcolor='black')
+        ax1.grid(True, alpha=0.3)
+
+        # Create secondary y-axis for mass flow rate
+        ax2 = ax1.twinx()
+
+        # Convert mass flow to g/s for better readability
+        mass_flow_gs = self.mass_flow_rate * 1000  # kg/s to g/s
+
+        line2, = ax2.plot(time_minutes, mass_flow_gs, 'r-', linewidth=2.5,
+                         label='Mass Flow Rate', alpha=0.8)
+
+        ax2.set_ylabel('Mass Flow Rate (g/s)', fontsize=16, color='red')
+        ax2.tick_params(axis='y', labelcolor='red', labelsize=14)
+
+        # Combine legends from both axes
+        lines1, labels1 = ax1.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax1.legend(lines1 + lines2, labels1 + labels2, fontsize=11, loc='upper left')
+
+        #ax1.set_title('Buoyancy Pressure & Mass Flow Rate Development', fontsize=20)
+
         # Add annotations for key points
         # Find time when buoyancy reaches 90% of final value
         final_buoyancy = total_buoyancy[-1]
@@ -1746,33 +3365,785 @@ Wall: {np.max(self.T_wall) - 273.15:.1f}"""
             idx_90 = np.where(total_buoyancy >= 0.9 * final_buoyancy)[0]
             if len(idx_90) > 0:
                 time_90 = time_minutes[idx_90[0]]
-                ax.axvline(x=time_90, color='red', linestyle=':', alpha=0.5)
-                ax.text(time_90, ax.get_ylim()[1]*0.95, f'90% at {time_90:.1f} min', 
-                       ha='center', va='top', fontsize=10, 
+                ax1.axvline(x=time_90, color='green', linestyle=':', alpha=0.5)
+                ax1.text(time_90, ax1.get_ylim()[1]*0.95, f'90% at {time_90:.1f} min',
+                       ha='center', va='top', fontsize=10,
                        bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.8))
-        
+
         # Add statistics box
         max_buoyancy = np.max(total_buoyancy)
-        
+        final_flow_gs = mass_flow_gs[-1]
+        max_flow_gs = np.max(mass_flow_gs)
+
         # Stack information
         total_height = sum(p.height_m for p in self.parts if p.orientation.lower() == 'vertical')
-        
+
         info_text = (
             f"Buoyancy Statistics:\n"
             f"• Maximum: {max_buoyancy:.1f} Pa\n"
             f"• Final: {final_buoyancy:.1f} Pa\n"
             f"\n"
+            f"Flow Rate:\n"
+            f"• Maximum: {max_flow_gs:.2f} g/s\n"
+            f"• Final: {final_flow_gs:.2f} g/s\n"
+            f"\n"
             f"Stack Info:\n"
-            f"• Total height: {total_height:.1f} m ({total_height/0.3048:.0f} ft)\n"
-            f"• Vertical parts: {sum(1 for p in self.parts if p.orientation.lower()=='vertical')}"
+            f"• Height: {total_height:.1f} m ({total_height/0.3048:.0f} ft)"
         )
-        
-        ax.text(0.98, 0.02, info_text, transform=ax.transAxes, 
-                fontsize=11, verticalalignment='bottom', ha='right',
-                bbox=dict(boxstyle='round,pad=0.5', facecolor='lightblue', alpha=0.8))
-        
+
+        ax1.text(0.98, 0.02, info_text, transform=ax1.transAxes,
+                fontsize=10, verticalalignment='bottom', ha='right',
+                bbox=dict(boxstyle='round,pad=0.5', facecolor='lightyellow', alpha=0.9))
+
         plt.tight_layout()
         plt.show()
+
+    def plot_available_draft(self):
+        """
+        Plot available draft (buoyancy minus losses) over time.
+
+        Uses consistent accounting with the momentum solver:
+        - dp_drive (buoyancy) is the driving pressure
+        - dp_losses = R_total × ṁ² includes friction, minor, and inlet restriction
+
+        Shows:
+        - Total buoyancy (gross draft from stack effect)
+        - Pressure losses (friction + minor + inlet restriction)
+        - Available draft (net draft = buoyancy - losses)
+        - Mass flow rate on secondary axis
+        """
+        fig, ax1 = plt.subplots(1, 1, figsize=(14, 6))
+
+        # Convert time to minutes
+        time_minutes = self.time_array / 60.0
+        n_steps = self.time_steps + 1
+
+        # Initialize arrays
+        total_buoyancy = np.zeros(n_steps)
+        total_friction_loss = np.zeros(n_steps)
+        total_minor_loss = np.zeros(n_steps)
+        total_inlet_loss = np.zeros(n_steps)
+        available_draft = np.zeros(n_steps)
+
+        # Calculate buoyancy and losses for each timestep
+        for step in range(n_steps):
+            current_seg = 0
+            step_buoyancy = 0.0
+            step_friction = 0.0
+            step_minor = 0.0
+
+            for part_idx, part in enumerate(self.parts):
+                end_seg = current_seg + part.num_segments
+                segment_length = part.height_m / part.num_segments
+                diameter = part.inner_diameter_m
+
+                for seg in range(current_seg, end_seg):
+                    local_seg = seg - current_seg
+
+                    # Gas properties
+                    T_gas = self.T_gas[step, seg]
+                    rho_gas = self.density[step, seg]
+                    rho_ambient = self.physics.air_density(part.T_ambient_K, part.Pa)
+
+                    # Buoyancy (only vertical segments contribute)
+                    if part.orientation.lower() == 'vertical':
+                        dp_buoyancy = 9.81 * segment_length * (rho_ambient - rho_gas)
+                        step_buoyancy += dp_buoyancy
+
+                    # Friction and minor losses (need flow)
+                    if step > 0:
+                        velocity = self.velocity[step, seg]
+
+                        if abs(velocity) > 0.01:
+                            # Friction factor
+                            mu = self.physics.air_viscosity(T_gas)
+                            Re = rho_gas * abs(velocity) * diameter / mu
+                            Re = max(Re, 100)
+
+                            relative_roughness = part.roughness_m / diameter
+                            if Re < 2300:
+                                f = 64 / Re
+                            elif relative_roughness < 1e-6:
+                                f = 0.316 / Re**0.25
+                            else:
+                                f = 0.25 / (np.log10(relative_roughness/3.7 + 5.74/Re**0.9))**2
+
+                            # Friction loss: f * (L/D) * (rho * v^2 / 2)
+                            dp_friction = f * (segment_length / diameter) * 0.5 * rho_gas * velocity**2
+                            step_friction += dp_friction
+
+                            # Minor losses (fittings) - use actual elbow K values (Feb 2 fix)
+                            elbow_key = (part_idx, local_seg)
+                            if hasattr(self, 'segment_elbows') and elbow_key in self.segment_elbows:
+                                for elbow_spec in self.segment_elbows[elbow_key]:
+                                    K_fitting = base_K(elbow_spec) * elbow_spec.vane_factor
+                                    dp_minor = K_fitting * 0.5 * rho_gas * velocity**2
+                                    step_minor += dp_minor
+
+                current_seg = end_seg
+
+            # Inlet restriction loss: dp_door = R_door × ṁ²
+            # R_door = K / (2 × ρ_inlet × A_eff²)
+            step_inlet = 0.0
+            if self.inlet_restriction.enable and step > 0:
+                rho_inlet = self.density[step, 0]
+                A_eff = self.inlet_restriction.effective_area_m2
+                K = self.inlet_restriction.K_equiv
+                mdot = self.mass_flow_rate[step]
+                R_door = K / (2.0 * rho_inlet * A_eff**2)
+                step_inlet = R_door * mdot**2
+
+            total_buoyancy[step] = step_buoyancy
+            total_friction_loss[step] = step_friction
+            total_minor_loss[step] = step_minor
+            total_inlet_loss[step] = step_inlet
+            available_draft[step] = step_buoyancy - step_friction - step_minor - step_inlet
+
+        # Total losses for plotting
+        total_losses = total_friction_loss + total_minor_loss + total_inlet_loss
+
+        # Plot draft components
+        line_buoy, = ax1.plot(time_minutes, total_buoyancy, 'b-', linewidth=2.5,
+                              label='Buoyancy (Gross Draft)', alpha=0.9)
+        line_loss, = ax1.plot(time_minutes, total_losses, 'r--', linewidth=2,
+                              label='Total Losses', alpha=0.8)
+        line_avail, = ax1.plot(time_minutes, available_draft, 'g-', linewidth=3,
+                               label='Available Draft (Net)', zorder=10)
+
+        # Fill between buoyancy and available draft to show losses
+        ax1.fill_between(time_minutes, available_draft, total_buoyancy,
+                        alpha=0.2, color='red', label='_nolegend_')
+
+        # Zero reference line
+        ax1.axhline(y=0, color='gray', linestyle=':', alpha=0.5, linewidth=1.5)
+
+        # Format primary axis
+        ax1.set_xlabel('Time (min)', fontsize=14)
+        ax1.set_ylabel('Pressure (Pa)', fontsize=14)
+        ax1.tick_params(axis='both', which='major', labelsize=12)
+        ax1.grid(True, alpha=0.3)
+
+        # Secondary axis for mass flow rate
+        ax2 = ax1.twinx()
+        mass_flow_gs = self.mass_flow_rate * 1000  # kg/s to g/s
+        line_flow, = ax2.plot(time_minutes, mass_flow_gs, 'k-', linewidth=1.5,
+                              label='Mass Flow Rate', alpha=0.6)
+        ax2.set_ylabel('Mass Flow Rate (g/s)', fontsize=14, color='gray')
+        ax2.tick_params(axis='y', labelcolor='gray', labelsize=12)
+
+        # Combined legend
+        lines = [line_buoy, line_loss, line_avail, line_flow]
+        labels = [l.get_label() for l in lines]
+        ax1.legend(lines, labels, fontsize=11, loc='upper left')
+
+        ax1.set_title('Available Draft Analysis', fontsize=16)
+
+        # Statistics box
+        final_buoyancy = total_buoyancy[-1]
+        final_losses = total_losses[-1]
+        final_available = available_draft[-1]
+        final_friction = total_friction_loss[-1]
+        final_minor = total_minor_loss[-1]
+        final_inlet = total_inlet_loss[-1]
+
+        # Draft efficiency
+        if final_buoyancy > 0:
+            efficiency = (final_available / final_buoyancy) * 100
+        else:
+            efficiency = 0
+
+        # Stack height
+        total_height = sum(p.height_m for p in self.parts if p.orientation.lower() == 'vertical')
+
+        # Build info text
+        info_lines = [
+            f"Final Values:",
+            f"• Buoyancy: {final_buoyancy:.1f} Pa",
+            f"• Friction Loss: {final_friction:.2f} Pa",
+            f"• Minor Loss: {final_minor:.2f} Pa",
+        ]
+        if self.inlet_restriction.enable:
+            info_lines.append(f"• Inlet Loss: {final_inlet:.2f} Pa")
+        info_lines.extend([
+            f"• Available Draft: {final_available:.1f} Pa",
+            f"• Efficiency: {efficiency:.0f}%",
+            f"",
+            f"Stack Height: {total_height:.2f} m"
+        ])
+        info_text = "\n".join(info_lines)
+
+        ax1.text(0.98, 0.02, info_text, transform=ax1.transAxes,
+                fontsize=10, verticalalignment='bottom', ha='right',
+                bbox=dict(boxstyle='round,pad=0.5', facecolor='lightyellow', alpha=0.9))
+
+        plt.tight_layout()
+        plt.show()
+
+        # Return key values for programmatic access
+        return {
+            'final_buoyancy_Pa': final_buoyancy,
+            'final_losses_Pa': final_losses,
+            'final_available_draft_Pa': final_available,
+            'final_inlet_loss_Pa': final_inlet,
+            'efficiency_percent': efficiency,
+            'time_minutes': time_minutes,
+            'buoyancy': total_buoyancy,
+            'losses': total_losses,
+            'inlet_loss': total_inlet_loss,
+            'available_draft': available_draft
+        }
+
+    def get_stack_differential_pressure(self, timestep=-1, measurement_height_m=None):
+        """
+        Calculate differential pressure profile along the stack.
+
+        This is what a field technician measures when they connect a manometer
+        between the stack interior and outdoor ambient at ground level.
+
+        ΔP(z) = P_inside(z) - P_ambient_at_reference
+
+        Args:
+            timestep: Which timestep to analyze (-1 for final)
+            measurement_height_m: Height at which to report ΔP (None = inlet)
+
+        Returns:
+            dict with:
+                - height_m: array of heights
+                - dP_Pa: differential pressure profile in Pa
+                - dP_inWC: differential pressure profile in inches water column
+                - dP_inlet_Pa: ΔP at stack inlet
+                - dP_inlet_inWC: ΔP at inlet in inches WC
+                - dP_at_height_Pa: ΔP at specified measurement height
+                - dP_at_height_inWC: ΔP at measurement height in inches WC
+        """
+        if timestep == -1:
+            timestep = self.time_steps
+
+        n_segs = self.total_segments
+
+        # Build height array (cumulative from bottom)
+        heights = np.zeros(n_segs + 1)  # Include both inlet and exit
+        seg_heights = np.zeros(n_segs)  # Height at segment center
+
+        cumulative_height = 0.0
+        for seg in range(n_segs):
+            part_idx, local_seg, part = self.get_segment_info(seg)
+            seg_length = self.segment_lengths[seg]
+
+            heights[seg] = cumulative_height
+            seg_heights[seg] = cumulative_height + seg_length / 2
+            cumulative_height += seg_length
+        heights[n_segs] = cumulative_height  # Top of stack
+
+        # Calculate buoyancy and friction for each segment
+        seg_buoyancy = np.zeros(n_segs)
+        seg_friction = np.zeros(n_segs)
+
+        for seg in range(n_segs):
+            part_idx, local_seg, part = self.get_segment_info(seg)
+            seg_length = self.segment_lengths[seg]
+            diameter = part.inner_diameter_m
+
+            T_gas = self.T_gas[timestep, seg]
+            rho_gas = self.density[timestep, seg]
+            rho_ambient = self.physics.air_density(part.T_ambient_K, part.Pa)
+            velocity = self.velocity[timestep, seg]
+
+            # Buoyancy (only vertical segments)
+            if part.orientation.lower() == 'vertical':
+                seg_buoyancy[seg] = 9.81 * seg_length * (rho_ambient - rho_gas)
+
+            # Friction
+            if abs(velocity) > 0.01:
+                mu = self.physics.air_viscosity(T_gas)
+                Re = rho_gas * abs(velocity) * diameter / mu
+                Re = max(Re, 10)
+
+                relative_roughness = part.roughness_m / diameter
+                if Re < 2300:
+                    f = 64 / Re
+                elif relative_roughness < 1e-6:
+                    f = 0.316 / Re**0.25
+                else:
+                    f = 0.25 / (np.log10(relative_roughness/3.7 + 5.74/Re**0.9))**2
+
+                seg_friction[seg] = f * (seg_length / diameter) * 0.5 * rho_gas * velocity**2
+
+        # Calculate ΔP profile (integrate from top down)
+        # At exit: ΔP ≈ 0 (connects to atmosphere)
+        # Moving down: ΔP = -buoyancy_above + friction_above
+        dP_profile = np.zeros(n_segs + 1)
+        dP_profile[n_segs] = 0.0  # Exit at atmospheric
+
+        buoyancy_above = 0.0
+        friction_above = 0.0
+
+        for seg in range(n_segs - 1, -1, -1):
+            buoyancy_above += seg_buoyancy[seg]
+            friction_above += seg_friction[seg]
+            dP_profile[seg] = -buoyancy_above + friction_above
+
+        # Convert to inches water column (1 inWC = 249.09 Pa)
+        PA_PER_INWC = 249.09
+        dP_inWC = dP_profile / PA_PER_INWC
+
+        # Find ΔP at specified measurement height
+        if measurement_height_m is None:
+            measurement_height_m = 0.0
+
+        # Interpolate to find ΔP at measurement height
+        dP_at_height = np.interp(measurement_height_m, heights, dP_profile)
+
+        return {
+            'height_m': heights,
+            'dP_Pa': dP_profile,
+            'dP_inWC': dP_inWC,
+            'dP_inlet_Pa': dP_profile[0],
+            'dP_inlet_inWC': dP_profile[0] / PA_PER_INWC,
+            'dP_at_height_Pa': dP_at_height,
+            'dP_at_height_inWC': dP_at_height / PA_PER_INWC,
+            'measurement_height_m': measurement_height_m,
+            'seg_buoyancy': seg_buoyancy,
+            'seg_friction': seg_friction
+        }
+
+    def print_stack_pressure_comparison(self, measured_dP_inWC, measurement_height_m=0.0, timestep=-1):
+        """
+        Compare simulated differential pressure to a field measurement.
+
+        Args:
+            measured_dP_inWC: Measured differential pressure in inches water column
+                             (negative = suction, typical for operating chimney)
+            measurement_height_m: Height where measurement was taken (0 = inlet)
+            timestep: Which simulation timestep to compare (-1 = final)
+        """
+        result = self.get_stack_differential_pressure(timestep, measurement_height_m)
+
+        simulated_inWC = result['dP_at_height_inWC']
+        simulated_Pa = result['dP_at_height_Pa']
+        measured_Pa = measured_dP_inWC * 249.09
+
+        diff_inWC = simulated_inWC - measured_dP_inWC
+        diff_Pa = simulated_Pa - measured_Pa
+
+        print("\n" + "="*60)
+        print("STACK PRESSURE COMPARISON")
+        print("="*60)
+        print(f"\nMeasurement height: {measurement_height_m:.2f} m")
+        print(f"\n{'':20} {'Simulated':>15} {'Measured':>15} {'Difference':>15}")
+        print("-"*65)
+        print(f"{'ΔP (inWC)':20} {simulated_inWC:>15.4f} {measured_dP_inWC:>15.4f} {diff_inWC:>15.4f}")
+        print(f"{'ΔP (Pa)':20} {simulated_Pa:>15.2f} {measured_Pa:>15.2f} {diff_Pa:>15.2f}")
+
+        # Assessment
+        print("\n" + "-"*65)
+        if abs(diff_inWC) < 0.005:
+            print("✓ Excellent agreement (within 0.005 inWC)")
+        elif abs(diff_inWC) < 0.01:
+            print("✓ Good agreement (within 0.01 inWC)")
+        elif abs(diff_inWC) < 0.02:
+            print("~ Fair agreement (within 0.02 inWC)")
+        else:
+            print("✗ Significant difference - check inputs or measurement location")
+
+        # Additional context
+        print(f"\nInlet ΔP: {result['dP_inlet_inWC']:.4f} inWC ({result['dP_inlet_Pa']:.2f} Pa)")
+
+        total_buoyancy = sum(result['seg_buoyancy'])
+        total_friction = sum(result['seg_friction'])
+        print(f"Total buoyancy: {total_buoyancy:.2f} Pa")
+        print(f"Total friction: {total_friction:.2f} Pa")
+        print("="*60)
+
+    def get_static_pressure_profile(self, timestep=-1):
+        """
+        Calculate static pressure profile along the stack.
+
+        Static pressure is the local gas pressure at each height.
+        P_gauge(z) = P_inside(z) - P_ambient(z)
+
+        For a hot chimney with good draft, P_gauge is negative (suction)
+        throughout the stack.
+
+        Args:
+            timestep: Which timestep to analyze (-1 for final)
+
+        Returns:
+            dict with:
+                - height_m: array of heights at segment boundaries
+                - P_gauge_Pa: gauge pressure profile (relative to local ambient)
+                - P_absolute_Pa: absolute pressure profile
+                - P_ambient_Pa: ambient pressure at each height
+        """
+        if timestep == -1:
+            timestep = self.time_steps
+
+        n_segs = self.total_segments
+
+        # Build height array
+        heights = np.zeros(n_segs + 1)
+        cumulative_height = 0.0
+
+        for seg in range(n_segs):
+            part_idx, local_seg, part = self.get_segment_info(seg)
+            seg_length = self.segment_lengths[seg]
+            heights[seg] = cumulative_height
+            cumulative_height += seg_length
+        heights[n_segs] = cumulative_height
+
+        # Get ambient pressure at each height (hydrostatic decrease with altitude)
+        # P(z) = P_0 * exp(-g*M*z / (R*T)) ≈ P_0 - rho_air * g * z for small z
+        P_ambient_base = self.parts[0].Pa
+        T_ambient_avg = np.mean([p.T_ambient_K for p in self.parts])
+        rho_ambient_avg = self.physics.air_density(T_ambient_avg, P_ambient_base)
+
+        P_ambient = P_ambient_base - rho_ambient_avg * 9.81 * heights
+
+        # Calculate pressure inside the stack
+        # Start from exit (top) where P_inside ≈ P_ambient
+        P_inside = np.zeros(n_segs + 1)
+        P_inside[n_segs] = P_ambient[n_segs]  # Exit at ambient
+
+        # Work down from top
+        for seg in range(n_segs - 1, -1, -1):
+            part_idx, local_seg, part = self.get_segment_info(seg)
+            seg_length = self.segment_lengths[seg]
+            diameter = part.inner_diameter_m
+
+            T_gas = self.T_gas[timestep, seg]
+            rho_gas = self.density[timestep, seg]
+            velocity = self.velocity[timestep, seg]
+
+            # Pressure change across this segment
+            # dP = -rho_gas * g * dz (hydrostatic) + friction_loss
+            dP_hydrostatic = -rho_gas * 9.81 * seg_length
+
+            # Friction loss
+            dP_friction = 0.0
+            if abs(velocity) > 0.01:
+                mu = self.physics.air_viscosity(T_gas)
+                Re = rho_gas * abs(velocity) * diameter / mu
+                Re = max(Re, 10)
+
+                relative_roughness = part.roughness_m / diameter
+                if Re < 2300:
+                    f = 64 / Re
+                elif relative_roughness < 1e-6:
+                    f = 0.316 / Re**0.25
+                else:
+                    f = 0.25 / (np.log10(relative_roughness/3.7 + 5.74/Re**0.9))**2
+
+                dP_friction = f * (seg_length / diameter) * 0.5 * rho_gas * velocity**2
+
+            # Fitting losses (Feb 2 fix) - add to pressure drop
+            dP_fitting = 0.0
+            elbow_key = (part_idx, local_seg)
+            if hasattr(self, 'segment_elbows') and elbow_key in self.segment_elbows:
+                for elbow_spec in self.segment_elbows[elbow_key]:
+                    K_fitting = base_K(elbow_spec) * elbow_spec.vane_factor
+                    dP_fitting += K_fitting * 0.5 * rho_gas * velocity**2
+
+            # Going from top to bottom: P_bottom = P_top - dP_hydrostatic + dP_friction + dP_fitting
+            # (Hydrostatic makes pressure higher at bottom, friction/fitting losses reduce it)
+            P_inside[seg] = P_inside[seg + 1] - dP_hydrostatic + dP_friction + dP_fitting
+
+        # Gauge pressure
+        P_gauge = P_inside - P_ambient
+
+        return {
+            'height_m': heights,
+            'P_gauge_Pa': P_gauge,
+            'P_absolute_Pa': P_inside,
+            'P_ambient_Pa': P_ambient
+        }
+
+    def plot_pressure_profile(self, timestep=-1):
+        """
+        Plot static and differential pressure profiles along the stack.
+
+        Creates a two-panel figure:
+        - Left: Static pressure (gauge) vs height
+        - Right: Differential pressure vs height
+
+        Args:
+            timestep: Which timestep to plot (-1 for final)
+        """
+        static = self.get_static_pressure_profile(timestep)
+        diff = self.get_stack_differential_pressure(timestep)
+
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 8))
+
+        # Left panel: Static pressure
+        ax1.plot(static['P_gauge_Pa'], static['height_m'], 'b-', linewidth=2, label='Static Pressure')
+        ax1.axvline(x=0, color='gray', linestyle=':', alpha=0.5)
+        ax1.set_xlabel('Static Pressure (Pa)', fontsize=12)
+        ax1.set_ylabel('Height (m)', fontsize=12)
+        ax1.set_title('Static Pressure Profile', fontsize=14)
+        ax1.grid(True, alpha=0.3)
+        ax1.legend()
+
+        # Add secondary x-axis for inWC
+        ax1_top = ax1.twiny()
+        x_min, x_max = ax1.get_xlim()
+        ax1_top.set_xlim(x_min / 249.09, x_max / 249.09)
+        ax1_top.set_xlabel('Static Pressure (inWC)', fontsize=10, color='gray')
+        ax1_top.tick_params(axis='x', labelcolor='gray')
+
+        # Right panel: Differential pressure
+        ax2.plot(diff['dP_Pa'], diff['height_m'], 'r-', linewidth=2, label='ΔP (vs ambient at ground)')
+        ax2.axvline(x=0, color='gray', linestyle=':', alpha=0.5)
+        ax2.set_xlabel('Differential Pressure (Pa)', fontsize=12)
+        ax2.set_ylabel('Height (m)', fontsize=12)
+        ax2.set_title('Differential Pressure Profile', fontsize=14)
+        ax2.grid(True, alpha=0.3)
+        ax2.legend()
+
+        # Add secondary x-axis for inWC
+        ax2_top = ax2.twiny()
+        x_min, x_max = ax2.get_xlim()
+        ax2_top.set_xlim(x_min / 249.09, x_max / 249.09)
+        ax2_top.set_xlabel('Differential Pressure (inWC)', fontsize=10, color='gray')
+        ax2_top.tick_params(axis='x', labelcolor='gray')
+
+        # Add annotations
+        total_height = static['height_m'][-1]
+        inlet_gauge = static['P_gauge_Pa'][0]
+        inlet_diff = diff['dP_Pa'][0]
+
+        info_text = (
+            f"Stack height: {total_height:.2f} m\n"
+            f"Inlet gauge P: {inlet_gauge:.2f} Pa ({inlet_gauge/249.09:.4f} inWC)\n"
+            f"Inlet ΔP: {inlet_diff:.2f} Pa ({inlet_diff/249.09:.4f} inWC)"
+        )
+
+        fig.text(0.5, 0.02, info_text, ha='center', fontsize=10,
+                bbox=dict(boxstyle='round,pad=0.5', facecolor='lightyellow', alpha=0.9))
+
+        plt.tight_layout()
+        plt.subplots_adjust(bottom=0.15)
+        plt.show()
+
+        return {
+            'static': static,
+            'differential': diff
+        }
+
+    def plot_standard_flow_rate(self, T_std_K=273.15, P_std_Pa=101325.0):
+        """
+        Plot standard volumetric flow rate over time.
+
+        Standard flow rate is the volumetric flow rate corrected to standard
+        conditions (default: 0°C, 1 atm). This is useful for comparing flow
+        rates across different operating conditions.
+
+        Q_std = ṁ / ρ_std
+
+        where ρ_std = P_std / (R × T_std)
+
+        Args:
+            T_std_K: Standard temperature in Kelvin (default: 273.15 K = 0°C)
+            P_std_Pa: Standard pressure in Pascals (default: 101325 Pa = 1 atm)
+
+        Returns:
+            dict with time and flow rate arrays
+        """
+        # Calculate standard density
+        R_AIR = 287.0  # J/(kg·K)
+        rho_std = P_std_Pa / (R_AIR * T_std_K)
+
+        # Convert mass flow to standard volumetric flow
+        # Q_std (m³/s) = ṁ (kg/s) / ρ_std (kg/m³)
+        Q_std_m3s = self.mass_flow_rate / rho_std
+
+        # Convert to m³/hr
+        Q_std_m3hr = Q_std_m3s * 3600.0
+
+        # Time in minutes
+        time_minutes = self.time_array / 60.0
+
+        # Create figure
+        fig, ax1 = plt.subplots(figsize=(12, 6))
+
+        # Plot standard flow rate
+        ax1.plot(time_minutes, Q_std_m3hr, 'b-', linewidth=2, label='Standard Flow Rate')
+        ax1.set_xlabel('Time (min)', fontsize=12)
+        ax1.set_ylabel('Standard Flow Rate (m³/hr)', fontsize=12)
+        ax1.set_title('Standard Volumetric Flow Rate', fontsize=14)
+        ax1.grid(True, alpha=0.3)
+
+        # Add secondary y-axis for CFM (cubic feet per minute)
+        ax2 = ax1.twinx()
+        Q_cfm = Q_std_m3hr / 60.0 * 35.3147  # m³/hr to CFM
+        ax2.set_ylabel('Standard Flow Rate (CFM)', fontsize=12, color='gray')
+        ax2.set_ylim(ax1.get_ylim()[0] / 60.0 * 35.3147, ax1.get_ylim()[1] / 60.0 * 35.3147)
+        ax2.tick_params(axis='y', labelcolor='gray')
+
+        # Statistics box
+        final_Q = Q_std_m3hr[-1]
+        max_Q = np.max(Q_std_m3hr)
+        avg_Q = np.mean(Q_std_m3hr[len(Q_std_m3hr)//2:])  # Average of second half
+
+        info_text = (
+            f"Standard Conditions:\n"
+            f"  T = {T_std_K - 273.15:.1f}°C ({T_std_K:.2f} K)\n"
+            f"  P = {P_std_Pa/1000:.1f} kPa\n"
+            f"  ρ = {rho_std:.3f} kg/m³\n"
+            f"\n"
+            f"Flow Rate:\n"
+            f"  Final: {final_Q:.2f} m³/hr\n"
+            f"  Max: {max_Q:.2f} m³/hr\n"
+            f"  Avg (2nd half): {avg_Q:.2f} m³/hr"
+        )
+
+        ax1.text(0.98, 0.02, info_text, transform=ax1.transAxes,
+                fontsize=10, verticalalignment='bottom', ha='right',
+                bbox=dict(boxstyle='round,pad=0.5', facecolor='lightyellow', alpha=0.9),
+                family='monospace')
+
+        ax1.legend(loc='upper left')
+
+        plt.tight_layout()
+        plt.show()
+
+        return {
+            'time_minutes': time_minutes,
+            'Q_std_m3hr': Q_std_m3hr,
+            'Q_std_m3s': Q_std_m3s,
+            'rho_std_kg_m3': rho_std,
+            'T_std_K': T_std_K,
+            'P_std_Pa': P_std_Pa
+        }
+
+    def plot_door_opening_and_flow(self, name=None):
+        """Plot door opening percentage and mass flow rate over time
+
+        Shows door opening (%) on left y-axis and mass flow (kg/s) on right y-axis.
+        Useful for visualizing how door changes affect flow rate.
+
+        Args:
+            name: Optional filename to save the figure
+        """
+        fig, ax1 = plt.subplots(figsize=(12, 6))
+
+        time_minutes = self.time_array / 60.0
+
+        # Left axis: Door opening percentage
+        color1 = 'tab:blue'
+        ax1.set_xlabel('Time (minutes)', fontsize=12)
+        ax1.set_ylabel('Door Opening (%)', fontsize=12, color=color1)
+        ax1.plot(time_minutes, self.door_opening_history, color=color1, linewidth=2,
+                 label='Door Opening')
+        ax1.tick_params(axis='y', labelcolor=color1)
+        ax1.set_ylim(-5, 105)
+        ax1.set_xlim(0, time_minutes[-1])
+
+        # Fill region to show door state
+        ax1.fill_between(time_minutes, 0, self.door_opening_history,
+                         alpha=0.2, color=color1)
+
+        # Right axis: Mass flow rate
+        ax2 = ax1.twinx()
+        color2 = 'tab:red'
+        ax2.set_ylabel('Mass Flow Rate (kg/s)', fontsize=12, color=color2)
+        ax2.plot(time_minutes, self.mass_flow_rate, color=color2, linewidth=2,
+                 linestyle='--', label='Mass Flow')
+        ax2.tick_params(axis='y', labelcolor=color2)
+
+        # Set y-limits for mass flow (add some padding)
+        max_flow = np.max(self.mass_flow_rate) * 1.1
+        min_flow = min(0, np.min(self.mass_flow_rate) * 1.1)
+        ax2.set_ylim(min_flow, max_flow)
+
+        # Title and grid
+        title = 'Door Opening and Mass Flow Rate Over Time'
+        if self.door_opening_func is not None:
+            title += ' (Dynamic Door Control)'
+        plt.title(title, fontsize=14)
+        ax1.grid(True, alpha=0.3)
+
+        # Combined legend
+        lines1, labels1 = ax1.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper right')
+
+        # Add statistics box
+        final_opening = self.door_opening_history[-1]
+        final_flow = self.mass_flow_rate[-1]
+        min_opening = np.min(self.door_opening_history)
+        max_opening = np.max(self.door_opening_history)
+
+        info_text = (
+            f"Door Opening:\n"
+            f"  Final: {final_opening:.0f}%\n"
+            f"  Range: {min_opening:.0f}% - {max_opening:.0f}%\n"
+            f"\n"
+            f"Mass Flow:\n"
+            f"  Final: {final_flow:.4f} kg/s\n"
+            f"  Max: {np.max(self.mass_flow_rate):.4f} kg/s"
+        )
+
+        ax1.text(0.02, 0.98, info_text, transform=ax1.transAxes,
+                fontsize=10, verticalalignment='top', ha='left',
+                bbox=dict(boxstyle='round,pad=0.5', facecolor='lightyellow', alpha=0.9),
+                family='monospace')
+
+        plt.tight_layout()
+        if name:
+            plt.savefig(name)
+        plt.show()
+
+    def print_flow_rate(self, interval_seconds: float = None):
+        """Print mass flow rate over time
+
+        Args:
+            interval_seconds: Time interval between printed values (seconds).
+                             If None, prints at ~10 evenly spaced points plus start/end.
+        """
+        print("\n" + "="*70)
+        print("MASS FLOW RATE OVER TIME")
+        print("="*70)
+
+        # Determine which timesteps to print
+        if interval_seconds is None:
+            # Print ~10 evenly spaced points
+            n_points = min(12, self.time_steps + 1)
+            indices = np.linspace(0, self.time_steps, n_points, dtype=int)
+        else:
+            # Print at specified interval
+            steps_per_interval = max(1, int(interval_seconds / self.dt))
+            indices = np.arange(0, self.time_steps + 1, steps_per_interval)
+            # Always include the last timestep
+            if indices[-1] != self.time_steps:
+                indices = np.append(indices, self.time_steps)
+
+        # Print header
+        print(f"\n{'Time (s)':>10} {'Time (min)':>12} {'Flow (kg/s)':>14} {'Flow (g/s)':>12}")
+        print("-" * 50)
+
+        for idx in indices:
+            time_s = self.time_array[idx]
+            time_min = time_s / 60.0
+            flow_kgs = self.mass_flow_rate[idx]
+            flow_gs = flow_kgs * 1000
+
+            print(f"{time_s:>10.1f} {time_min:>12.2f} {flow_kgs:>14.6f} {flow_gs:>12.3f}")
+
+        # Print summary statistics
+        print("-" * 50)
+        print(f"\nSummary Statistics:")
+        print(f"  Initial flow rate:  {self.mass_flow_rate[0]*1000:.3f} g/s")
+        print(f"  Final flow rate:    {self.mass_flow_rate[-1]*1000:.3f} g/s")
+        print(f"  Maximum flow rate:  {np.max(self.mass_flow_rate)*1000:.3f} g/s")
+        print(f"  Minimum flow rate:  {np.min(self.mass_flow_rate)*1000:.3f} g/s")
+        print(f"  Average flow rate:  {np.mean(self.mass_flow_rate)*1000:.3f} g/s")
+
+        # Check for backdraft (negative flow)
+        if np.any(self.mass_flow_rate < 0):
+            backdraft_times = self.time_array[self.mass_flow_rate < 0]
+            print(f"\n  WARNING: Backdraft detected!")
+            print(f"  Negative flow from {backdraft_times[0]:.1f}s to {backdraft_times[-1]:.1f}s")
+
+        print("="*70 + "\n")
     #Done
     def temp_evolution_by_segment(self):
         """Plot temperature evolution for each individual segment"""
@@ -1781,9 +4152,11 @@ Wall: {np.max(self.T_wall) - 273.15:.1f}"""
         
         # First plot the inlet temperature in black
         T_ambient_inlet = self.parts[0].T_ambient_K
-        inlet_temps = np.array([self._default_inlet_temp(t, T_ambient=T_ambient_inlet) 
-                               for t in self.time_array]) - 273.15
-        ax.plot(self.time_array, inlet_temps, 
+        # Get inlet temperatures (uses CSV if available, otherwise default model)
+        inlet_temps = np.array([self._get_inlet_temp(t, T_ambient=T_ambient_inlet)
+                                 for t in self.time_array]) - 273.15
+
+        ax.plot(self.time_array, inlet_temps,
                 label='Inlet Gas', color='black', linestyle='-', linewidth=3, zorder=10)
         
         current_seg = 0
