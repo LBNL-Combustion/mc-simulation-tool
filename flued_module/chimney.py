@@ -77,12 +77,22 @@ class InletRestrictionConfig:
 
     # Leakage area - minimum flow area when door is fully closed
     # Default 0.005 m² = 50 cm² represents gaps around a closed door
-    A_leak_m2: float = 0.005
+    A_leak_m2: float = 0.0045
 
     # Maximum effective area - caps A_eff at downstream restriction (tee/pipe)
     # If None, no cap is applied (door geometry determines area)
     # Set to pipe area (e.g., 0.0182 m² for 6" pipe) when door opens into restricted space
     max_effective_area_m2: Optional[float] = None
+
+    # Stove body K-loss coefficient - represents resistance INSIDE the stove
+    # that applies regardless of door position:
+    #   - Fuel bed resistance (K ≈ 2-4 depending on loading)
+    #   - Baffle losses (K ≈ 1-2)
+    #   - Flue collar entry (K ≈ 0.5)
+    # Total K_stove ≈ 4-6 for typical woodstove
+    # This is added as: R_stove = K_stove / (2 × ρ × A_pipe²)
+    # Set to 0 to disable (legacy behavior)
+    K_stove: float = 0.0
 
     # Optional override (if set, bypasses Cd calculation)
     K_loss_override: Optional[float] = None
@@ -3800,9 +3810,10 @@ Wall: {np.max(self.T_wall) - 273.15:.1f}"""
         P_ambient = P_ambient_base - rho_ambient_avg * 9.81 * heights
 
         # Calculate pressure inside the stack
-        # Start from exit (top) where P_inside ≈ P_ambient
+        # Start from exit (top) where P_inside = P_ambient + wind_cap_effect
         P_inside = np.zeros(n_segs + 1)
-        P_inside[n_segs] = P_ambient[n_segs]  # Exit at ambient
+        deltaP_wind = getattr(self, '_last_deltaP_wind_cap', 0.0)
+        P_inside[n_segs] = P_ambient[n_segs] + deltaP_wind
 
         # Work down from top
         for seg in range(n_segs - 1, -1, -1):
@@ -3835,7 +3846,7 @@ Wall: {np.max(self.T_wall) - 273.15:.1f}"""
 
                 dP_friction = f * (seg_length / diameter) * 0.5 * rho_gas * velocity**2
 
-            # Fitting losses (Feb 2 fix) - add to pressure drop
+            # Fitting losses - add to pressure drop
             dP_fitting = 0.0
             elbow_key = (part_idx, local_seg)
             if hasattr(self, 'segment_elbows') and elbow_key in self.segment_elbows:

@@ -360,7 +360,16 @@ class CoupledFlowThermalSolver:
         # Using inlet density for consistency (flow enters at inlet conditions)
         R_door = K / (2.0 * rho_inlet * A_eff**2)
 
-        return R_door
+        # Add stove body resistance (fuel bed, baffles, flue collar)
+        # This uses PIPE AREA (not door area) since it's inside the stove
+        # R_stove = K_stove / (2 × ρ × A_pipe²)
+        R_stove = 0.0
+        K_stove = getattr(chimney.inlet_restriction, 'K_stove', 0.0)
+        if K_stove > 0:
+            A_pipe = chimney.parts[0].inner_area_m2  # Use first part's area
+            R_stove = K_stove / (2.0 * rho_inlet * A_pipe**2)
+
+        return R_door + R_stove
 
     def _calculate_catalytic_bypass_loss(self, chimney, mass_flow_rate: float,
                                          densities: np.ndarray) -> float:
@@ -751,7 +760,7 @@ class CoupledFlowThermalSolver:
         
         # Update pressure distribution
         new_pressures = np.zeros_like(pressures)
-        new_pressures[0] = 101325  # Atmospheric at inlet
+        new_pressures[0] = 101325  # Reference pressure at inlet
         
         for seg in range(1, chimney.total_segments):
             # Pressure change = buoyancy - friction loss
