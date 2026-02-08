@@ -9,6 +9,7 @@ from .physics import PhysicalProperties
 from .comprehensive_heat_transfer import ComprehensiveHeatTransfer
 from .coupled_solver import CoupledFlowThermalSolver
 from .diagnostics_recorder import DiagnosticsRecorder
+from .room_plenum import RoomPlenum, RoomPlenumConfig
 from .early_diagnostics import EarlyTimeDiagnostics
 from .chimney_geometry_plot import plot_chimney_geometry, plot_chimney_snapshot
 from .wind_cap_effects import WindCapConfig, wind_cap_deltaP
@@ -538,6 +539,7 @@ class Chimney:
                  leakage_config: Optional[Dict[str, Any]] = None,
                  enable_diagnostics: bool = False,
                  momentum_config: Optional[Dict[str, Any]] = None,
+                 room_plenum: Optional[Dict[str, Any]] = None,
                  verbose: bool = False):
         """Initialize chimney simulation
 
@@ -695,6 +697,14 @@ class Chimney:
         # Initialize diagnostics recorder (default off)
         self.diagnostics_recorder = DiagnosticsRecorder(enable=enable_diagnostics)
 
+        # Initialize room plenum (default off)
+        if room_plenum is not None and isinstance(room_plenum, dict):
+            self.room_plenum = RoomPlenum(RoomPlenumConfig(**room_plenum))
+        elif room_plenum is not None:
+            self.room_plenum = room_plenum
+        else:
+            self.room_plenum = RoomPlenum(RoomPlenumConfig(enable=False))
+
         # Build MomentumConfig from dict if provided
         from .coupled_solver import MomentumConfig
         if momentum_config is not None and isinstance(momentum_config, dict):
@@ -803,12 +813,20 @@ class Chimney:
                 # Static door - copy previous value
                 self.door_opening_history[step] = self.door_opening_history[step - 1]
 
+            # STEP 0b: UPDATE ROOM PLENUM PRESSURE (if enabled)
+            # Uses previous-timestep chimney mass flow to compute new room pressure
+            if self.room_plenum.cfg.enable:
+                mdot_prev = self.mass_flow_rate[step - 1]
+                Pa_ambient = self.parts[0].Pa
+                dp_room = self.room_plenum.update(mdot_prev, Pa_ambient, self.dt)
+                self.room_pressure_offset_Pa = dp_room
+
             # STEP 1: CALCULATE INLET TEMPERATURE
             # This is the temperature of gas entering the bottom of the chimney
             # Uses CSV data if provided, otherwise default exponential ramp-up
             T_ambient_inlet = self.parts[0].T_ambient_K
             T_inlet = self._get_inlet_temp(self.current_time, T_ambient=T_ambient_inlet)
-            
+
             # STEP 2: SOLVE PHYSICS EQUATIONS
             if self.use_coupled_solver:
                 # COUPLED APPROACH: Iterate between flow and thermal equations
