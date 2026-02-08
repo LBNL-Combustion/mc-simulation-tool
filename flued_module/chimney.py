@@ -537,6 +537,7 @@ class Chimney:
                  room_pressure_offset_Pa: float = 0.0,
                  leakage_config: Optional[Dict[str, Any]] = None,
                  enable_diagnostics: bool = False,
+                 momentum_config: Optional[Dict[str, Any]] = None,
                  verbose: bool = False):
         """Initialize chimney simulation
 
@@ -694,12 +695,22 @@ class Chimney:
         # Initialize diagnostics recorder (default off)
         self.diagnostics_recorder = DiagnosticsRecorder(enable=enable_diagnostics)
 
+        # Build MomentumConfig from dict if provided
+        from .coupled_solver import MomentumConfig
+        if momentum_config is not None and isinstance(momentum_config, dict):
+            self._momentum_config = MomentumConfig(**momentum_config)
+        elif momentum_config is not None:
+            self._momentum_config = momentum_config
+        else:
+            self._momentum_config = None
+
         # Initialize coupled solver if requested
         # Coupled solver iterates between flow and thermal equations for consistency
         self.use_coupled_solver = use_coupled_solver
         if use_coupled_solver:
             self.coupled_solver = CoupledFlowThermalSolver(
-                diagnostics=self.diagnostics_recorder
+                diagnostics=self.diagnostics_recorder,
+                momentum_config=self._momentum_config,
             )
             self.convergence_history = []  # Track convergence metrics for debugging
             

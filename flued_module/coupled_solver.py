@@ -25,6 +25,11 @@ class MomentumConfig:
     leak_relaxation: float = 0.5           # Relaxation factor for leakage updates
     C_accel: float = 1.0                   # Acceleration loss coefficient
 
+    # --- Flow model ---
+    # "quasi_steady" (default): algebraic mdot_ss with first-order lag (current)
+    # "unsteady_momentum": ODE-based L_eff/A * d(mdot)/dt = dp_avail - dp_loss
+    flow_model: str = "quasi_steady"
+
 
 @dataclass
 class ConvergenceMetrics:
@@ -730,26 +735,47 @@ class CoupledFlowThermalSolver:
         total_resistance = max(total_resistance, 1e-6)
 
         # ============================================================
-        # MOMENTUM BALANCE: dp_drive = R_total × ṁ²
-        # Solve for steady-state mass flow
+        # MOMENTUM BALANCE
         # ============================================================
-        # ṁ_steady = sign(dp_drive) × sqrt(|dp_drive| / R_total)
-        mass_flow_magnitude = np.sqrt(abs(dp_drive) / total_resistance)
-        mass_flow_steady = np.sign(dp_drive) * mass_flow_magnitude
-
-        # Handle case where dp_drive ≈ 0 (naturally gives mdot_steady ≈ 0)
-        if abs(dp_drive) < 1e-10:
-            mass_flow_steady = 0.0
-
-        # Apply inertia (first-order response toward steady state)
-        # Time constant based on system inertia
         system_length = sum(chimney.segment_lengths)
-        tau = avg_density * system_length / (total_resistance * (abs(mass_flow_steady) + 1e-6))
-        tau = max(tau, dt)  # At least one timestep
+        typical_area = chimney.parts[0].inner_area_m2
 
-        # Relaxation factor (limit to prevent overshooting)
-        alpha = min(dt / (tau + dt), 0.5)
-        mass_flow_new = mass_flow_old + alpha * (mass_flow_steady - mass_flow_old)
+        if self.momentum_config.flow_model == "unsteady_momentum":
+            # --- Unsteady momentum ODE ---
+            # L_eff / A * d(mdot)/dt = dp_available - dp_losses(mdot)
+            #
+            # dp_losses = R_total * mdot * |mdot|  (quadratic, sign-preserving)
+            #
+            # Forward Euler update:
+            #   mdot_{n+1} = mdot_n + dt * (A / L_eff) * RHS
+            # where RHS = dp_drive - R_total * mdot_n * |mdot_n|
+
+            L_eff = system_length  # effective inertial length
+            A_eff_mom = typical_area  # representative cross-section
+
+            dp_losses_current = total_resistance * mass_flow_old * abs(mass_flow_old)
+            RHS = dp_drive - dp_losses_current
+
+            # Update mdot with stable integrator
+            mass_flow_new = mass_flow_old + dt * (A_eff_mom / L_eff) * RHS
+
+        else:
+            # --- Quasi-steady (default): algebraic mdot_ss + first-order lag ---
+            # mdot_ss = sign(dp_drive) * sqrt(|dp_drive| / R_total)
+            mass_flow_magnitude = np.sqrt(abs(dp_drive) / total_resistance)
+            mass_flow_steady = np.sign(dp_drive) * mass_flow_magnitude
+
+            # Handle case where dp_drive ~ 0
+            if abs(dp_drive) < 1e-10:
+                mass_flow_steady = 0.0
+
+            # First-order lag toward steady state
+            tau = avg_density * system_length / (total_resistance * (abs(mass_flow_steady) + 1e-6))
+            tau = max(tau, dt)  # At least one timestep
+
+            # Relaxation factor (limit to prevent overshooting)
+            alpha = min(dt / (tau + dt), 0.5)
+            mass_flow_new = mass_flow_old + alpha * (mass_flow_steady - mass_flow_old)
 
         # Apply leakage adjustment to mass flow
         # Positive leakage = air leaking IN (adds mass) → increases outlet flow
@@ -758,7 +784,6 @@ class CoupledFlowThermalSolver:
 
         # Calculate geometry-based bounds
         max_velocity = 50.0  # m/s - reasonable upper limit
-        typical_area = chimney.parts[0].inner_area_m2
         max_mass_flow_magnitude = max_velocity * avg_density * typical_area
 
         # Allow both positive and negative flow, but limit magnitude
