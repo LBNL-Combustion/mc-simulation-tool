@@ -814,8 +814,8 @@ class Chimney:
                     self.flow_reversal_count += 1
                     print(f"\n{'='*60}")
                     print(f"[BACKDRAFT DETECTED] Flow reversal at t={self.current_time:.1f}s")
-                    print(f"  Mass flow: {previous_flow:.4f} → {current_flow:.4f} kg/s")
-                    print(f"  Flow direction: UPWARD → DOWNWARD (backdraft)")
+                    print(f"  Mass flow: {previous_flow:.4f} -> {current_flow:.4f} kg/s")
+                    print(f"  Flow direction: UPWARD -> DOWNWARD (backdraft)")
                     print(f"{'='*60}\n")
 
                 # Detect transition from backdraft to normal draft (recovery)
@@ -824,8 +824,8 @@ class Chimney:
                     duration = self.backdraft_end_time - (self.backdraft_start_time or 0)
                     print(f"\n{'='*60}")
                     print(f"[DRAFT RESTORED] Normal flow resumed at t={self.current_time:.1f}s")
-                    print(f"  Mass flow: {previous_flow:.4f} → {current_flow:.4f} kg/s")
-                    print(f"  Flow direction: DOWNWARD → UPWARD (normal draft)")
+                    print(f"  Mass flow: {previous_flow:.4f} -> {current_flow:.4f} kg/s")
+                    print(f"  Flow direction: DOWNWARD -> UPWARD (normal draft)")
                     print(f"  Backdraft duration: {duration:.1f}s")
                     print(f"{'='*60}\n")
 
@@ -862,7 +862,7 @@ class Chimney:
                     else:
                         V_current = V
                     sign_str = "suction" if dP < 0 else "pressurization"
-                    print(f"  [WIND CAP] V={V_current:.1f} m/s, cap={self._wind_cfg.cap_type}, ΔP={dP:+.2f} Pa ({sign_str})")
+                    print(f"  [WIND CAP] V={V_current:.1f} m/s, cap={self._wind_cfg.cap_type}, dP={dP:+.2f} Pa ({sign_str})")
                 
         print("Comprehensive simulation completed successfully")
         
@@ -1221,13 +1221,16 @@ class Chimney:
             gas_props = self.comprehensive_ht.gas_properties(self.T_gas[step, seg], part.Pa)
             gas_props.velocity = velocity
             
-            # Fittings (elbows, tees) increase pressure drop
-            fittings_factor = 1.5 if part.has_fittings else 1.0
-            
+            # Look up actual elbows for this segment
+            elbow_key = (part_idx, local_seg)
+            seg_elbows = None
+            if hasattr(self, 'segment_elbows') and elbow_key in self.segment_elbows:
+                seg_elbows = self.segment_elbows[elbow_key]
+
             # Calculate pressure drop from friction (Darcy-Weisbach equation)
             dp_loss_seg = self.comprehensive_ht.pressure_drop(
-                gas_props, part.inner_diameter_m, segment_length, 
-                velocity, part.roughness_m, fittings_factor
+                gas_props, part.inner_diameter_m, segment_length,
+                velocity, part.roughness_m, elbows=seg_elbows
             )
             total_pressure_loss += dp_loss_seg
         
@@ -1264,12 +1267,31 @@ class Chimney:
                 self.density[step, seg] * part.inner_area_m2
             )
             
-            # Pressure (simplified - just track relative values)
+            # Pressure profile: integrate buoyancy minus friction per segment
             if seg == 0:
                 self.pressure[step, seg] = part.Pa  # Reference pressure
             else:
-                # Pressure decreases due to friction and increases due to buoyancy
-                self.pressure[step, seg] = self.pressure[step, seg-1]  # Simplified
+                segment_length = part.height_m / part.num_segments
+                rho_gas = self.density[step, seg]
+                rho_ambient = self.comprehensive_ht.gas_properties(part.T_ambient_K, part.Pa).density
+                dp_buoyancy = 9.81 * segment_length * (rho_ambient - rho_gas)
+
+                # Friction loss for this segment
+                velocity = self.velocity[step, seg]
+                dp_friction = 0.0
+                if abs(velocity) > 0.01:
+                    gas_props = self.comprehensive_ht.gas_properties(self.T_gas[step, seg], part.Pa)
+                    gas_props.velocity = velocity
+                    elbow_key = (part_idx, local_seg)
+                    seg_elbows = None
+                    if hasattr(self, 'segment_elbows') and elbow_key in self.segment_elbows:
+                        seg_elbows = self.segment_elbows[elbow_key]
+                    dp_friction = self.comprehensive_ht.pressure_drop(
+                        gas_props, part.inner_diameter_m, segment_length,
+                        velocity, part.roughness_m, elbows=seg_elbows
+                    )
+
+                self.pressure[step, seg] = self.pressure[step, seg-1] + dp_buoyancy - dp_friction
     #Done
     def get_summary_data(self) -> Dict[str, Any]:
         """Get summary data from the simulation"""
@@ -1609,7 +1631,7 @@ class Chimney:
             elbow_key = (i, part.num_segments - 1)
             if hasattr(self, 'segment_elbows') and elbow_key in self.segment_elbows:
                 for elbow in self.segment_elbows[elbow_key]:
-                    elbow_desc = f"       └─ FITTING: {elbow.angle_deg:.0f}°"
+                    elbow_desc = f"       +-- FITTING: {elbow.angle_deg:.0f}°"
                     elbow_desc += f" {elbow.elbow_type.replace('_', '-')}"
                     elbow_desc += f" (R/D={elbow.R_over_D:.1f})"
                     if elbow.vane_factor < 1.0:
@@ -1657,7 +1679,7 @@ class Chimney:
         if warnings:
             print("\nWarnings:")
             for warning in warnings:
-                print(f"  ⚠ {warning}")
+                print(f"  [!] {warning}")
         
         print("="*70)
     
@@ -1716,13 +1738,12 @@ class Chimney:
             start_seg = sum(p.num_segments for p in self.parts[:i])
             end_seg = start_seg + part.num_segments
             
-            # CRITICAL PHYSICS FIX: Only bottom segment gets hot air initially
-            # All other segments start at ambient temperature
-            # Gas heats up walls as it flows upward, cooling in the process
+            # Gas initialization: bottom segment gets inlet temp, others start at local ambient
+            # Hot gas from the fire propagates up over time, heating each segment
             for seg in range(start_seg, end_seg):
                 if seg == 0:
-                    # Bottom segment gets hot inlet air
-                    # Use inlet_temp_func or CSV at t=0 if available (initial conditions fix)
+                    # Bottom segment gets hot inlet air (from fire)
+                    # Use inlet_temp_func or CSV at t=0 if available
                     if self.inlet_temp_func is not None:
                         initial_gas_temp = float(self.inlet_temp_func(0.0))
                     elif self.inlet_temp_interp is not None:
@@ -1730,10 +1751,11 @@ class Chimney:
                     else:
                         initial_gas_temp = part.T_ambient_K + 10.0  # Small initial rise
                 else:
-                    # All other segments start at ambient (cold)
-                    # They will be heated by the hot gas flowing through
+                    # Other segments start at their local ambient temperature
+                    # Indoor sections at T_indoor, outdoor sections at T_outdoor
+                    # Hot gas propagates up as simulation runs
                     initial_gas_temp = part.T_ambient_K
-                
+
                 # Initialize ALL timesteps to prevent -273.1°C issue
                 self.T_gas[:, seg] = initial_gas_temp
             
@@ -1989,9 +2011,9 @@ class Chimney:
               f"{'(from Cd)' if self.inlet_restriction.K_loss_override is None else '(manual override)'}")
         print(f"")
         print(f"Resistance Model (added to total_resistance):")
-        print(f"  R_door = K / (2 × ρ × A_eff²)")
-        print(f"  R_door ≈ {R_door_ref:.2f} Pa·s²/kg² (at ρ={rho_ref} kg/m³)")
-        print(f"  ΔP_door = R_door × ṁ²")
+        print(f"  R_door = K / (2 * rho * A_eff^2)")
+        print(f"  R_door ~= {R_door_ref:.2f} Pa*s^2/kg^2 (at rho={rho_ref} kg/m^3)")
+        print(f"  dP_door = R_door * mdot^2")
         print("="*70 + "\n")
 
     def _update_door_opening(self, opening_percent: float):
@@ -3742,22 +3764,22 @@ Wall: {np.max(self.T_wall) - 273.15:.1f}"""
         print(f"\nMeasurement height: {measurement_height_m:.2f} m")
         print(f"\n{'':20} {'Simulated':>15} {'Measured':>15} {'Difference':>15}")
         print("-"*65)
-        print(f"{'ΔP (inWC)':20} {simulated_inWC:>15.4f} {measured_dP_inWC:>15.4f} {diff_inWC:>15.4f}")
-        print(f"{'ΔP (Pa)':20} {simulated_Pa:>15.2f} {measured_Pa:>15.2f} {diff_Pa:>15.2f}")
+        print(f"{'dP (inWC)':20} {simulated_inWC:>15.4f} {measured_dP_inWC:>15.4f} {diff_inWC:>15.4f}")
+        print(f"{'dP (Pa)':20} {simulated_Pa:>15.2f} {measured_Pa:>15.2f} {diff_Pa:>15.2f}")
 
         # Assessment
         print("\n" + "-"*65)
         if abs(diff_inWC) < 0.005:
-            print("✓ Excellent agreement (within 0.005 inWC)")
+            print("[OK] Excellent agreement (within 0.005 inWC)")
         elif abs(diff_inWC) < 0.01:
-            print("✓ Good agreement (within 0.01 inWC)")
+            print("[OK] Good agreement (within 0.01 inWC)")
         elif abs(diff_inWC) < 0.02:
             print("~ Fair agreement (within 0.02 inWC)")
         else:
-            print("✗ Significant difference - check inputs or measurement location")
+            print("[X] Significant difference - check inputs or measurement location")
 
         # Additional context
-        print(f"\nInlet ΔP: {result['dP_inlet_inWC']:.4f} inWC ({result['dP_inlet_Pa']:.2f} Pa)")
+        print(f"\nInlet dP: {result['dP_inlet_inWC']:.4f} inWC ({result['dP_inlet_Pa']:.2f} Pa)")
 
         total_buoyancy = sum(result['seg_buoyancy'])
         total_friction = sum(result['seg_friction'])

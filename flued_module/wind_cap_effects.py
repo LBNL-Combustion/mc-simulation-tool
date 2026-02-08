@@ -182,18 +182,18 @@ if __name__ == "__main__":
         sign = "suction" if dP < 0 else "pressurization"
         effect = "aids draft" if dP < 0 else "hurts draft"
         Cp = cap_Cp(cap, "open", 0.0, None)
-        print(f"  {cap:12s}: Cp={Cp:+.2f}, ΔP={dP:+6.2f} Pa ({sign:15s}, {effect})")
+        print(f"  {cap:12s}: Cp={Cp:+.2f}, dP={dP:+6.2f} Pa ({sign:15s}, {effect})")
 
     print("\nExposure Effects (venturi cap):")
     for exp in ["open", "suburban", "sheltered"]:
         dP = wind_cap_deltaP(Pa, T, V, "venturi", exp, 0.0)
         Cp = cap_Cp("venturi", exp, 0.0, None)
-        print(f"  {exp:10s}: Cp={Cp:+.2f}, ΔP={dP:+6.2f} Pa")
+        print(f"  {exp:10s}: Cp={Cp:+.2f}, dP={dP:+6.2f} Pa")
 
     print("\nWind Speed Sensitivity (venturi, open):")
     for V_test in [0, 2, 5, 10, 15]:
         dP = wind_cap_deltaP(Pa, T, V_test, "venturi", "open", 0.0)
-        print(f"  V={V_test:2d} m/s: ΔP={dP:+7.2f} Pa")
+        print(f"  V={V_test:2d} m/s: dP={dP:+7.2f} Pa")
 
     print("\nSign Convention Validation:")
     dP_venturi = wind_cap_deltaP(Pa, T, V, "venturi", "open", 0.0)
@@ -203,9 +203,9 @@ if __name__ == "__main__":
     assert dP_rain > 0, "Rain cap should create pressurization (positive ΔP)"
     assert abs(dP_venturi) > abs(dP_rain), "Venturi should have larger magnitude"
 
-    print("  ✓ Venturi creates suction (aids draft)")
-    print("  ✓ Rain cap creates pressurization (hurts draft)")
-    print("  ✓ Magnitudes correct")
+    print("  [OK] Venturi creates suction (aids draft)")
+    print("  [OK] Rain cap creates pressurization (hurts draft)")
+    print("  [OK] Magnitudes correct")
 
     print("\n" + "="*70)
     print("ALL VALIDATION TESTS PASSED")
