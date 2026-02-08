@@ -95,13 +95,25 @@ class InletRestrictionConfig:
     # Set to 0 to disable (legacy behavior)
     K_stove: float = 0.0
 
+    # --- Effective area combination mode ---
+    # "linear" (default): A_eff = A_eff_raw + A_leak  (current behavior)
+    # "quadrature": A_eff = sqrt(A_eff_raw^2 + A_leak^2)
+    #   Quadrature avoids the non-smooth kink at A_eff_raw=0 and is more
+    #   physically motivated (two parallel flow paths).
+    inlet_area_mode: str = "linear"
+
+    # --- Effective area cap mode ---
+    # "none" (default): no additional cap (only max_effective_area_m2 applies)
+    # "pipe": cap A_eff at the first part's pipe cross-section area
+    inlet_area_cap_mode: str = "none"
+
     # Optional override (if set, bypasses Cd calculation)
     K_loss_override: Optional[float] = None
 
     # Computed values (set during initialization)
     door_area_m2: float = 0.0  # Full door area from dimensions [m²]
     A_eff_raw_m2: float = 0.0  # Raw area from geometry
-    effective_area_m2: float = 0.0  # Total area = A_eff_raw + A_leak
+    effective_area_m2: float = 0.0  # Total area (method depends on inlet_area_mode)
     K_equiv: float = 0.0  # = 1/Cd² unless K_loss_override is set
 
 
@@ -1941,12 +1953,27 @@ class Chimney:
 
         self.inlet_restriction.A_eff_raw_m2 = A_eff_raw
 
-        # --- ADD MINIMUM LEAKAGE AREA ---
-        # When door is fully closed, there's still some leakage through gaps.
-        # A_eff_used = A_eff_raw + A_leak
-        # This ensures finite resistance even when door is closed (opening% = 0).
+        # --- COMBINE RAW AREA WITH LEAKAGE ---
+        # Two modes available:
+        #   "linear" (default):    A_eff = A_eff_raw + A_leak
+        #   "quadrature":          A_eff = sqrt(A_eff_raw^2 + A_leak^2)
+        # Quadrature is smoother near A_eff_raw=0 and models two parallel
+        # orifice paths whose resistances add in parallel.
         A_leak = self.inlet_restriction.A_leak_m2
-        A_eff_used = A_eff_raw + A_leak
+        area_mode = self.inlet_restriction.inlet_area_mode.lower()
+        if area_mode == "quadrature":
+            A_eff_used = math.sqrt(A_eff_raw**2 + A_leak**2)
+        else:
+            # Default: linear
+            A_eff_used = A_eff_raw + A_leak
+
+        # --- CAP AT PIPE AREA (optional) ---
+        cap_mode = self.inlet_restriction.inlet_area_cap_mode.lower()
+        if cap_mode == "pipe":
+            A_pipe = self.parts[0].inner_area_m2
+            if A_eff_used > A_pipe:
+                A_eff_used = A_pipe
+                print(f"  [Note: A_eff capped at pipe area = {A_pipe*1e4:.0f} cm^2]")
 
         # --- CAP AT MAXIMUM EFFECTIVE AREA ---
         # Even when door is wide open, flow is limited by downstream restriction
@@ -1954,7 +1981,7 @@ class Chimney:
         max_area = self.inlet_restriction.max_effective_area_m2
         if max_area is not None and A_eff_used > max_area:
             A_eff_used = max_area
-            print(f"  [Note: A_eff capped at max_effective_area = {max_area*1e4:.0f} cm²]")
+            print(f"  [Note: A_eff capped at max_effective_area = {max_area*1e4:.0f} cm^2]")
 
         self.inlet_restriction.effective_area_m2 = A_eff_used
 
@@ -2060,9 +2087,19 @@ class Chimney:
 
         self.inlet_restriction.A_eff_raw_m2 = A_eff_raw
 
-        # Add minimum leakage area: A_eff_used = A_eff_raw + A_leak
+        # Combine raw area with leakage using configured mode
         A_leak = self.inlet_restriction.A_leak_m2
-        A_eff_used = A_eff_raw + A_leak
+        area_mode = self.inlet_restriction.inlet_area_mode.lower()
+        if area_mode == "quadrature":
+            A_eff_used = math.sqrt(A_eff_raw**2 + A_leak**2)
+        else:
+            A_eff_used = A_eff_raw + A_leak
+
+        # Cap at pipe area if configured
+        cap_mode = self.inlet_restriction.inlet_area_cap_mode.lower()
+        if cap_mode == "pipe":
+            A_pipe = self.parts[0].inner_area_m2
+            A_eff_used = min(A_eff_used, A_pipe)
 
         # Cap at maximum effective area (e.g., tee/pipe opening)
         max_area = self.inlet_restriction.max_effective_area_m2
