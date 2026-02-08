@@ -586,6 +586,20 @@ class Chimney:
                    This allows directly passing experimental data (e.g., TC1).
                    If both inlet_temp_csv and inlet_temp_func are provided,
                    inlet_temp_func takes precedence.
+            enable_diagnostics: If True, record per-timestep momentum and energy
+                   budgets for post-simulation analysis. Default False (no overhead).
+                   Access via chimney.diagnostics_recorder.to_dataframe().
+            momentum_config: Optional dict or MomentumConfig for momentum physics:
+                   - flow_model: "quasi_steady" (default) or "unsteady_momentum"
+                   - gas_energy_model: "current" (default) or "plugflow_ntu"
+                   - use_distributed_leakage: bool (default False)
+                   - use_accel_loss: bool (default False)
+                   Example: {'flow_model': 'unsteady_momentum', 'gas_energy_model': 'plugflow_ntu'}
+            room_plenum: Optional dict or RoomPlenum for room depressurization:
+                   - enable: bool (default False)
+                   - V_room_m3: room volume (default 50 m3)
+                   - A_room_leak_m2: envelope leakage area (default 0.02 m2)
+                   Example: {'enable': True, 'V_room_m3': 40, 'A_room_leak_m2': 0.01}
         """
         self.inlet_temp_csv = inlet_temp_csv
         self.inlet_temp_func = inlet_temp_func

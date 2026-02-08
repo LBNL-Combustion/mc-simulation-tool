@@ -12,8 +12,17 @@ from .chimney import Chimney
 from .mass_flow import MassFlow
 from .physics import PhysicalProperties
 from .diagnostics_recorder import DiagnosticsRecorder
+from .coupled_solver import MomentumConfig
+from .room_plenum import RoomPlenumConfig
 
 __version__ = "1.0.0"
 __author__ = "Converted from FLUESIM5.BAS"
 
-__all__ = ["Chimney", "MassFlow", "PhysicalProperties", "DiagnosticsRecorder"]
+__all__ = [
+    "Chimney",
+    "MassFlow",
+    "PhysicalProperties",
+    "DiagnosticsRecorder",
+    "MomentumConfig",
+    "RoomPlenumConfig",
+]
