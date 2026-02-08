@@ -3,13 +3,14 @@ Comprehensive heat transfer model for chimney/flue systems
 Improved physics with stable numerics and proper coupling
 """
 import numpy as np
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, Optional, Tuple, List, Literal
 from dataclasses import dataclass
 from .condensation_physics import CondensationPhysics, CondensationState
 from .stable_triple_wall import StableTripleWallSolver, WallLayerProperties
 from .adaptive_triple_wall import AdaptiveTripleWallSolver
 #from .energy_diagnostics import EnergyDiagnostics
 import logging
+import warnings
 
 @dataclass
 class FlowProperties:
@@ -39,21 +40,29 @@ class ComprehensiveHeatTransfer:
     # PHYSICAL CONSTANTS
     STEFAN_BOLTZMANN = 5.67e-8  # W/(m²·K⁴) - for radiation calculations
     
-    def __init__(self):
-        """Initialize heat transfer calculator"""
+    def __init__(self, include_interlayer_radiation: bool = True):
+        """Initialize heat transfer calculator
+
+        Args:
+            include_interlayer_radiation: If True (default), adaptive triple-wall
+                solver includes inter-layer radiation. Passed through to
+                AdaptiveTripleWallSolver.
+        """
         from .physics import PhysicalProperties
         self.physics = PhysicalProperties()
         self.condensation = CondensationPhysics()
         self.triple_wall_solver = StableTripleWallSolver()
-        self.adaptive_solver = AdaptiveTripleWallSolver()
+        self.adaptive_solver = AdaptiveTripleWallSolver(
+            include_interlayer_radiation=include_interlayer_radiation
+        )
         #self.energy_diagnostics = EnergyDiagnostics()
         self.logger = logging.getLogger(__name__)
-        
+
         # Track condensation state for each segment
         self.condensation_states = {}
     
     
-    def gas_properties(self, temperature_K: float, pressure_Pa: float = 101325) -> FlowProperties:
+    def gas_properties(self, temperature_K: float, pressure_Pa: float = 98457) -> FlowProperties:
         """Calculate flue gas properties at given temperature and pressure
         
         These properties are essential for heat transfer and flow calculations.
@@ -345,7 +354,9 @@ class ComprehensiveHeatTransfer:
     
     def pressure_drop(self, props: FlowProperties, diameter: float, length: float, 
                      velocity: float, roughness: float = 0.0, 
-                     fittings_factor: float = 1.0) -> float:
+                     fittings_factor: float = 1.0,
+                     elbows: Optional[List] = None,
+                     elbow_method: Literal["K_sum", "equivalent_length"] = "K_sum") -> float:
         """
         Calculate pressure drop due to friction and fittings
         
@@ -355,7 +366,9 @@ class ComprehensiveHeatTransfer:
             length: Pipe length in m
             velocity: Flow velocity in m/s
             roughness: Surface roughness in m
-            fittings_factor: Factor for additional losses from fittings
+            fittings_factor: Factor for additional losses from fittings (deprecated)
+            elbows: Optional list of ElbowSpec objects for physics-based elbow losses
+            elbow_method: Method for calculating elbow losses ("K_sum" or "equivalent_length")
             
         Returns:
             Pressure drop in Pa
@@ -374,11 +387,50 @@ class ComprehensiveHeatTransfer:
                 # Approximate for rough pipes
                 f = 0.25 / (np.log10(roughness / (3.7 * diameter) + 5.74 / Re**0.9))**2
         
-        # Pressure drop
-        dp_friction = f * (length / diameter) * 0.5 * props.density * velocity**2
+        # Effective length for friction calculation
+        effective_length = length
+        K_total_elbows = 0.0
         
-        # Include fittings losses
-        dp_total = dp_friction * fittings_factor
+        # Process physics-based elbow losses if provided
+        if elbows:
+            from .flow.elbows import elbow_losses
+            
+            # Calculate volumetric flow rate
+            area = np.pi * (diameter / 2)**2
+            volumetric_flow = velocity * area
+            
+            for elbow_spec in elbows:
+                # Calculate losses for this elbow
+                elbow_loss = elbow_losses(
+                    elbow_spec, 
+                    rho=props.density,
+                    mu=props.viscosity,
+                    volumetric_flow_m3_s=volumetric_flow
+                )
+                
+                if elbow_method == "equivalent_length":
+                    # Add equivalent length to the straight pipe length
+                    effective_length += elbow_loss.Le_m
+                else:  # K_sum method
+                    # Accumulate K values
+                    K_total_elbows += elbow_loss.K
+        
+        # Calculate friction pressure drop using effective length
+        dp_friction = f * (effective_length / diameter) * 0.5 * props.density * velocity**2
+        
+        # Add minor losses from K values (if using K_sum method)
+        dp_minor = K_total_elbows * 0.5 * props.density * velocity**2
+        
+        # Apply legacy fittings_factor if no elbows specified (backward compatibility)
+        if not elbows and fittings_factor != 1.0:
+            warnings.warn(
+                "fittings_factor is deprecated. Use elbows parameter with ElbowSpec objects instead.",
+                DeprecationWarning,
+                stacklevel=2
+            )
+            dp_total = dp_friction * fittings_factor
+        else:
+            dp_total = dp_friction + dp_minor
         
         return dp_total
     
@@ -425,12 +477,29 @@ class ComprehensiveHeatTransfer:
         delta_T = abs(T_hot - T_cold)
         if delta_T > 0.1:  # Minimum temperature difference
             # Rayleigh number for vertical enclosure
-            beta = 1 / T_mean  # thermal expansion coefficient
-            Ra = (self.physics.GRAVITY * beta * delta_T * gap_width**3 * 
-                  air_props.density**2) / (air_props.viscosity * 
-                  air_props.thermal_conductivity / air_props.specific_heat)
-            
-            # Nusselt number for vertical enclosures (Churchill & Chu)
+            # Ra = Gr × Pr, where:
+            #   Gr = g × β × ΔT × L³ / ν²  (Grashof number)
+            #   Pr = ν / α = μ × cp / k    (Prandtl number)
+            #   ν = μ / ρ                  (kinematic viscosity)
+            #   α = k / (ρ × cp)           (thermal diffusivity)
+            #
+            # Expanding: Ra = g × β × ΔT × L³ × ρ² × cp / (μ × k)
+            # where L = gap_width (characteristic length for enclosed gap)
+            #
+            # Reference: Incropera & DeWitt, Fundamentals of Heat and Mass Transfer
+            beta = 1 / T_mean  # thermal expansion coefficient for ideal gas [1/K]
+            g = self.physics.GRAVITY
+            L = gap_width
+            rho = air_props.density
+            mu = air_props.viscosity
+            k = air_props.thermal_conductivity
+            cp = air_props.specific_heat
+
+            Ra = (g * beta * delta_T * L**3 * rho**2 * cp) / (mu * k)
+
+            # Nusselt number for vertical enclosures
+            # Hollands/Catton correlation for 10^4 < Ra < 10^7, 10 < H/W < 40
+            # Reference: Catton, I. (1978) "Natural Convection in Enclosures"
             if Ra < 1e4:
                 Nu = 1.0  # Pure conduction
             elif Ra < 1e10:
@@ -602,6 +671,42 @@ class ComprehensiveHeatTransfer:
                 geometry, properties, dt
             )
     
+    def _create_default_elbow_from_fittings(self, has_fittings: bool, diameter: float) -> Optional[List]:
+        """
+        Create default ElbowSpec objects for backward compatibility.
+        
+        Args:
+            has_fittings: Legacy boolean flag indicating presence of fittings
+            diameter: Pipe diameter in meters
+            
+        Returns:
+            List with one default ElbowSpec if has_fittings is True, else None
+        """
+        if not has_fittings:
+            return None
+            
+        from .flow.elbows import ElbowSpec
+        
+        # Create a default 90° short-radius elbow as approximation
+        # This maintains similar pressure drop behavior to the old 1.5x factor
+        default_elbow = ElbowSpec(
+            angle_deg=90.0,
+            diameter_m=diameter,
+            R_over_D=1.0,  # Short radius
+            elbow_type="short_radius",
+            smoothness="commercial_steel",
+            vane_factor=1.0
+        )
+        
+        self.logger.debug("Created default elbow for backward compatibility with has_fittings=True")
+        warnings.warn(
+            "has_fittings flag is deprecated. Define explicit ElbowSpec objects for accurate modeling.",
+            DeprecationWarning,
+            stacklevel=3
+        )
+        
+        return [default_elbow]
+    
     def calculate_segment_heat_transfer(self, segment_data: Dict, dt: float) -> Dict:
         """
         Calculate complete heat transfer for a chimney segment with iterative condensation coupling
@@ -658,11 +763,11 @@ class ComprehensiveHeatTransfer:
         # Elbows, tees create turbulence that enhances heat transfer
         if has_fittings:
             h_forced *= 1.2  # 20% increase is typical for fittings
-        
+
         # Iterative solution for coupled heat transfer and condensation
         max_iterations = 5
         tolerance = 1e-4
-        
+
         # Initialize temperatures
         if wall_type == 'single':
             T_wall_current = segment_data['wall_temperature']
@@ -671,7 +776,7 @@ class ComprehensiveHeatTransfer:
             T_middle_current = segment_data['middle_temperature']
             T_outer_current = segment_data['outer_temperature']
             T_wall_current = T_liner_current  # Use liner as reference
-        
+
         # ITERATIVE COUPLING LOOP
         # Wall temperature affects condensation which affects heat transfer
         # Need to iterate to find consistent solution
@@ -679,7 +784,7 @@ class ComprehensiveHeatTransfer:
             # Store previous values to check convergence
             T_wall_prev = T_wall_current
             humidity_ratio_prev = humidity_ratio
-            
+
             # NATURAL CONVECTION (from temperature differences)
             # Hot wall creates buoyancy-driven flow along the surface
             Gr = self.grashof_number(diameter, T_wall_current, T_gas, gas_props)
@@ -696,13 +801,26 @@ class ComprehensiveHeatTransfer:
             
             # ENGINEERING MINIMUMS
             # Real chimneys have turbulence, roughness that prevent very low h
-            h_min_chimney = 20.0  # W/(m²·K) - typical minimum for hot vertical flow
-            h_min_general = 1.0   # W/(m²·K) - absolute minimum for stability
-            
-            if orientation.lower() == 'vertical' and h_inner < h_min_chimney and T_gas > T_wall_current + 10:
+            # The low calculated h values don't match experimental observations
+            # because correlations don't account for:
+            # - Surface roughness and imperfections
+            # - Entrance/exit effects
+            # - Turbulent mixing from fittings and bends
+            # - Buoyancy-enhanced mixing in vertical sections
+            h_min_chimney = 10.0  # W/(m²·K) - reduced from 20 to prevent over-predicted heat loss
+            h_min_general = 5.0   # W/(m²·K) - minimum for other orientations
+
+            # Apply minimum based on orientation and gas temperature
+            # Use absolute temperature threshold (100°C) instead of relative difference
+            # This prevents feedback loop where low h → low ΔT → minimum not applied
+            T_gas_C = T_gas - 273.15
+            is_hot_gas = T_gas_C > 100  # Gas above 100°C is considered "hot"
+
+            if orientation.lower() == 'vertical' and is_hot_gas:
                 # Hot gas in vertical chimney should have good heat transfer
-                self.logger.debug(f"Increasing h_inner from {h_inner:.1f} to {h_min_chimney} W/(m²·K)")
-                h_inner = h_min_chimney
+                if h_inner < h_min_chimney:
+                    self.logger.debug(f"Increasing h_inner from {h_inner:.1f} to {h_min_chimney} W/(m²·K)")
+                h_inner = max(h_inner, h_min_chimney)
             else:
                 # Apply general minimum to prevent numerical issues
                 h_inner = max(h_inner, h_min_general)
@@ -710,19 +828,19 @@ class ComprehensiveHeatTransfer:
             # Update condensation state
             area = np.pi * diameter * length
             condensation_state = self.condensation_states[segment_id]
-            
+
             # Modify heat transfer coefficient for condensate film
             h_inner_modified = self.condensation.film_heat_transfer_modification(
                 h_inner, condensation_state.film_thickness
             )
-            
+
             # Update condensation with current wall temperature
             condensation_state = self.condensation.update_condensation_state(
-                condensation_state, T_gas, T_wall_current, pressure, 
+                condensation_state, T_gas, T_wall_current, pressure,
                 humidity_ratio, h_inner_modified, area, dt
             )
             self.condensation_states[segment_id] = condensation_state
-            
+
             # Add latent heat effect to inner heat transfer
             if condensation_state.latent_heat_rate != 0:
                 # Effective heat transfer coefficient including latent heat
@@ -731,13 +849,13 @@ class ComprehensiveHeatTransfer:
                 h_inner_effective = q_total / (area * (T_gas - T_wall_current)) if T_gas != T_wall_current else h_inner_modified
             else:
                 h_inner_effective = h_inner_modified
-            
+
             # Update humidity ratio based on condensation
             if segment_data.get('mass_flow_rate', 0) > 0:
                 gas_volume = np.pi * (diameter/2)**2 * length
                 humidity_ratio = self.condensation.gas_humidity_change(
                     humidity_ratio, condensation_state.net_rate,
-                    segment_data['mass_flow_rate'], gas_volume, 
+                    segment_data['mass_flow_rate'], gas_volume,
                     gas_props.density, dt
                 )
             
@@ -822,7 +940,20 @@ class ComprehensiveHeatTransfer:
             
             if residual < tolerance and humidity_residual < tolerance:
                 break
-        
+
+        # Apply spiral corrugation heat transfer enhancement (v2.0)
+        # This multiplier is pre-computed during preprocessing and stored in part.corrugation_effects
+        # It accounts for swirl-induced enhancement of convective heat transfer
+        corrugation = segment_data.get('corrugation', None)
+        if corrugation is not None and corrugation.get('type') == 'spiral':
+            # Check if HT enhancement is enabled
+            if corrugation.get('enable_spiral_HT_enhancement', False):
+                # Get the multiplier from the part's corrugation_effects
+                # This is set during preprocessing in chimney.py
+                Mh = segment_data.get('Mh', 1.0)
+                h_inner_effective *= Mh
+                self.logger.debug(f"Applied spiral HT multiplier Mh={Mh:.3f} to h_inner")
+
         # Prepare results
         if wall_type == 'single':
             results = {
@@ -841,9 +972,21 @@ class ComprehensiveHeatTransfer:
             }
         
         # Common calculations
-        fittings_factor = 1.5 if has_fittings else 1.0
-        dp = self.pressure_drop(gas_props, diameter, length, velocity, 
-                               fittings_factor=fittings_factor)
+        # Check for explicit elbow specifications first
+        elbows = segment_data.get('elbows', None)
+        elbow_method = segment_data.get('elbow_method', 'K_sum')
+        
+        # If no explicit elbows but has_fittings is True, create default for backward compatibility
+        if elbows is None and has_fittings:
+            elbows = self._create_default_elbow_from_fittings(has_fittings, diameter)
+        
+        # Calculate pressure drop with elbow support
+        dp = self.pressure_drop(
+            gas_props, diameter, length, velocity,
+            roughness=segment_data.get('roughness', 0.0),
+            elbows=elbows,
+            elbow_method=elbow_method
+        )
         
         ambient_density = self.gas_properties(T_ambient, pressure).density
         dp_buoyancy = self.buoyancy_pressure(length, ambient_density, gas_props.density)
