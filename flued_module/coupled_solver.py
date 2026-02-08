@@ -30,6 +30,14 @@ class MomentumConfig:
     # "unsteady_momentum": ODE-based L_eff/A * d(mdot)/dt = dp_avail - dp_loss
     flow_model: str = "quasi_steady"
 
+    # --- Gas energy model ---
+    # "current" (default): existing relaxation-based gas temperature update
+    # "plugflow_ntu": NTU/effectiveness model per segment
+    #   T_out = T_in - effectiveness * (T_in - T_wall)
+    #   effectiveness = 1 - exp(-UA / (mdot * cp))
+    #   Ensures energy conservation: Q_gas = Q_wall per segment per timestep.
+    gas_energy_model: str = "current"
+
 
 @dataclass
 class ConvergenceMetrics:
@@ -1060,32 +1068,58 @@ class CoupledFlowThermalSolver:
 
             if abs(mass_flow) > 1e-6 and not is_inlet_boundary:
                 # Flowing case with advection (skip inlet boundaries)
-                # Energy in: mass_flow * cp * T_upstream
-                # Energy out: mass_flow * cp * T_current + q_loss_to_walls + q_latent
-                # Storage: gas_mass * cp * dT/dt
 
-                # Heat loss to walls (positive when gas loses heat)
-                q_loss_to_walls = h_inner * area * (temperatures[seg] - T_wall)
+                if self.momentum_config.gas_energy_model == "plugflow_ntu":
+                    # --- Plug-flow NTU/effectiveness model ---
+                    # Treat segment as a heat exchanger with:
+                    #   hot side = gas flowing through
+                    #   cold side = wall at T_wall (inner surface)
+                    #
+                    # UA = h_inner * A_inner (convective conductance)
+                    # effectiveness = 1 - exp(-UA / (mdot * cp))
+                    # T_out = T_in - effectiveness * (T_in - T_wall)
+                    #
+                    # Energy removed from gas = h_inner * A * effectiveness * (T_in - T_wall)
+                    # This equals the wall source term for energy conservation.
 
-                # Advection terms
-                # Use upwind differencing for stability
-                residence_time = gas_mass / abs(mass_flow)  # Time gas spends in segment (use abs for safety)
+                    UA = h_inner * area
+                    mdot_cp = abs(mass_flow) * cp
+                    NTU = UA / (mdot_cp + 1e-10)
+                    effectiveness = 1.0 - np.exp(-NTU)
 
-                # Temperature change due to advection and heat loss
-                # dT/dt = (T_in - T_out)/tau - Q_loss/(m*cp)
-                # For steady flow: T_out ≈ T_in - Q_loss*tau/(m*cp)
+                    # Include condensation latent heat as additional "heat loss"
+                    q_latent = ht_results.get('latent_heat_rate', 0)
 
-                # Include condensation latent heat if present
-                q_latent = ht_results.get('latent_heat_rate', 0)
-                q_total_loss = q_loss_to_walls + q_latent
+                    # Gas outlet temperature for this segment
+                    T_out_ntu = T_upstream - effectiveness * (T_upstream - T_wall)
 
-                # Stable formulation: new temperature based on upstream and heat loss
-                T_steady = T_upstream - q_total_loss * residence_time / (gas_mass * cp)
+                    # Adjust for latent heat (small correction)
+                    if q_latent != 0 and mdot_cp > 1e-6:
+                        T_out_ntu -= q_latent / mdot_cp
 
-                # Apply relaxation toward steady state
-                tau_thermal = gas_mass * cp / (abs(mass_flow) * cp + h_inner * area)
-                alpha = dt / (tau_thermal + dt)
-                new_temperatures[seg] = temperatures[seg] + alpha * (T_steady - temperatures[seg])
+                    new_temperatures[seg] = T_out_ntu
+
+                else:
+                    # --- Current model (default) ---
+                    # Relaxation-based gas temperature update
+
+                    # Heat loss to walls (positive when gas loses heat)
+                    q_loss_to_walls = h_inner * area * (temperatures[seg] - T_wall)
+
+                    # Advection terms
+                    residence_time = gas_mass / abs(mass_flow)
+
+                    # Include condensation latent heat if present
+                    q_latent = ht_results.get('latent_heat_rate', 0)
+                    q_total_loss = q_loss_to_walls + q_latent
+
+                    # Stable formulation: new temperature based on upstream and heat loss
+                    T_steady = T_upstream - q_total_loss * residence_time / (gas_mass * cp)
+
+                    # Apply relaxation toward steady state
+                    tau_thermal = gas_mass * cp / (abs(mass_flow) * cp + h_inner * area)
+                    alpha = dt / (tau_thermal + dt)
+                    new_temperatures[seg] = temperatures[seg] + alpha * (T_steady - temperatures[seg])
             elif is_inlet_boundary:
                 # Inlet boundary - temperature is fixed by boundary condition
                 if mass_flow >= 0:
