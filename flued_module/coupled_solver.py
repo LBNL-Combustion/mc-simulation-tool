@@ -754,18 +754,26 @@ class CoupledFlowThermalSolver:
             #
             # dp_losses = R_total * mdot * |mdot|  (quadratic, sign-preserving)
             #
-            # Forward Euler update:
-            #   mdot_{n+1} = mdot_n + dt * (A / L_eff) * RHS
-            # where RHS = dp_drive - R_total * mdot_n * |mdot_n|
+            # IMPORTANT: Always integrate from the *previous timestep* mdot,
+            # NOT from the Picard iteration's current estimate. The Picard loop
+            # re-evaluates dp_drive and R_total at updated T/rho, but the ODE
+            # starting point is fixed for the timestep.
+            #
+            # Semi-implicit Euler (unconditionally stable):
+            #   mdot_new = (mdot_prev + C * dp_drive) / (1 + C * R_total * |mdot_prev|)
+            # where C = dt * A / L_eff
 
             L_eff = system_length  # effective inertial length
             A_eff_mom = typical_area  # representative cross-section
 
-            dp_losses_current = total_resistance * mass_flow_old * abs(mass_flow_old)
-            RHS = dp_drive - dp_losses_current
+            # Previous timestep mdot (fixed ODE starting point)
+            step_idx = chimney.time_step
+            mdot_prev_timestep = chimney.mass_flow_rate[step_idx - 1] if step_idx > 0 else 0.0
 
-            # Update mdot with stable integrator
-            mass_flow_new = mass_flow_old + dt * (A_eff_mom / L_eff) * RHS
+            C_mom = dt * A_eff_mom / L_eff  # [s * m^2 / m] = [m*s]
+            numerator = mdot_prev_timestep + C_mom * dp_drive
+            denominator = 1.0 + C_mom * total_resistance * abs(mdot_prev_timestep)
+            mass_flow_new = numerator / denominator
 
         else:
             # --- Quasi-steady (default): algebraic mdot_ss + first-order lag ---
