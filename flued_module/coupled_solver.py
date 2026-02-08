@@ -8,6 +8,7 @@ import logging
 
 from .flow.elbows import base_K
 from .mass_flow import calculate_leakage_mass_flow, calculate_accel_pressure_loss
+from .diagnostics_recorder import DiagnosticsRecorder
 
 @dataclass
 class MomentumConfig:
@@ -48,7 +49,8 @@ class CoupledFlowThermalSolver:
     
     def __init__(self, tolerance: float = 1e-3, max_iterations: int = 5,
                  relaxation_factor: float = 0.3,
-                 momentum_config: Optional[MomentumConfig] = None):
+                 momentum_config: Optional[MomentumConfig] = None,
+                 diagnostics: Optional[DiagnosticsRecorder] = None):
         """
         Initialize coupled solver
 
@@ -59,11 +61,15 @@ class CoupledFlowThermalSolver:
                               Lower values = more stable but slower convergence
                               Higher values = faster but may oscillate
             momentum_config: Configuration for momentum physics features (leakage, accel loss)
+            diagnostics: Optional DiagnosticsRecorder for budget tracking (default off)
         """
         self.tolerance = tolerance
         self.max_iterations = max_iterations
         self.relaxation_factor = relaxation_factor
         self.logger = logging.getLogger(__name__)
+
+        # Diagnostics recorder (off by default)
+        self.diagnostics = diagnostics if diagnostics is not None else DiagnosticsRecorder(enable=False)
 
         # Momentum physics configuration
         if momentum_config is None:
@@ -75,7 +81,7 @@ class CoupledFlowThermalSolver:
         if self.momentum_config.distributed_draft_model:
             self.momentum_config.use_distributed_leakage = True
             self.momentum_config.use_accel_loss = True
-        
+
         # Adaptive relaxation parameters
         self.min_relaxation = 0.2
         self.max_relaxation = 0.5
@@ -807,6 +813,56 @@ class CoupledFlowThermalSolver:
             dp_segment = buoyancy[seg-1] - dp_friction - dp_minor
             new_pressures[seg] = new_pressures[seg-1] + dp_segment
 
+        # --- Diagnostics: record momentum budget ---
+        if self.diagnostics.enable:
+            # Compute itemized loss components for diagnostics
+            dp_friction_total = 0.0
+            dp_fittings_total = 0.0
+            for seg in range(chimney.total_segments):
+                part_idx, local_seg, part = segment_cache[seg]
+                area = part.inner_area_m2
+                diameter = part.inner_diameter_m
+                length_s = chimney.segment_lengths[seg]
+                vel = mass_flow_new / (densities[seg] * area) if abs(mass_flow_new) > 1e-10 else 0.0
+                f_seg = friction_factors.get(seg, 0.01)
+                dp_friction_total += f_seg * (length_s / diameter) * 0.5 * densities[seg] * vel**2
+                elbow_key = (part_idx, local_seg)
+                if hasattr(chimney, 'segment_elbows') and elbow_key in chimney.segment_elbows:
+                    for elbow_spec in chimney.segment_elbows[elbow_key]:
+                        K_elbow = base_K(elbow_spec) * elbow_spec.vane_factor
+                        dp_fittings_total += K_elbow * 0.5 * densities[seg] * vel**2
+
+            # Inlet and stove resistance as dp
+            dp_inlet_diag = R_door * mass_flow_new**2 if abs(mass_flow_new) > 1e-10 else 0.0
+            dp_stove_diag = 0.0
+            K_stove_val = getattr(chimney.inlet_restriction, 'K_stove', 0.0) if hasattr(chimney, 'inlet_restriction') else 0.0
+            if K_stove_val > 0 and abs(mass_flow_new) > 1e-10:
+                A_pipe = chimney.parts[0].inner_area_m2
+                R_stove_diag = K_stove_val / (2.0 * rho_inlet * A_pipe**2)
+                dp_stove_diag = R_stove_diag * mass_flow_new**2
+
+            dp_bypass_diag = 0.0
+            if abs(mass_flow_new) > 1e-10:
+                dp_bypass_diag = self._calculate_catalytic_bypass_loss(chimney, mass_flow_new, densities)
+
+            self.diagnostics.record_momentum_budget(
+                step=chimney.time_step,
+                time_s=chimney.current_time,
+                mdot=mass_flow_new,
+                velocity_mean=float(np.mean(np.abs(mass_flow_new / (densities * chimney.parts[0].inner_area_m2)))),
+                rho_mean=float(avg_density),
+                dp_buoyancy=float(np.sum(buoyancy)),
+                dp_wind_cap=float(deltaP_wind),
+                dp_room=float(room_depress),
+                dp_friction=dp_friction_total,
+                dp_fittings=dp_fittings_total,
+                dp_inlet=dp_inlet_diag,
+                dp_stove=dp_stove_diag,
+                dp_bypass=dp_bypass_diag,
+                dp_accel=dp_accel_total,
+                dp_leakage=0.0,  # leakage modifies mdot, not dp directly
+            )
+
         return mass_flow_new, new_pressures
     
     def _solve_energy_improved(self, chimney, step: int, temperatures: np.ndarray,
@@ -1023,9 +1079,41 @@ class CoupledFlowThermalSolver:
             if seg > 0:
                 T_min_physical = part.T_ambient_K
                 T_max_physical = 1073.15  # 800°C max
-                
+
                 # Apply bounds
                 new_temperatures[seg] = max(new_temperatures[seg], T_min_physical)
                 new_temperatures[seg] = min(new_temperatures[seg], T_max_physical)
-            
+
+        # --- Diagnostics: record energy budget ---
+        if self.diagnostics.enable:
+            # Compute bulk energy flows
+            cp_in = chimney.physics.air_specific_heat(temperatures[0])
+            cp_out = chimney.physics.air_specific_heat(new_temperatures[-1])
+            Q_adv = abs(mass_flow) * (cp_in * temperatures[0] - cp_out * new_temperatures[-1])
+
+            Q_wall = 0.0
+            Q_lat = 0.0
+            for seg in range(chimney.total_segments):
+                p_idx, l_seg, prt = segment_cache[seg]
+                seg_len = chimney.segment_lengths[seg]
+                area_s = np.pi * prt.inner_diameter_m * seg_len
+                h_i = chimney.h_conv_inner[step, seg] if step > 0 else 10.0
+                if prt.type == 'single':
+                    Tw = chimney.T_wall[step, seg]
+                else:
+                    Tw = chimney.T_liner[step, seg]
+                Q_wall += h_i * area_s * (new_temperatures[seg] - Tw)
+
+            self.diagnostics.record_energy_budget(
+                step=chimney.time_step,
+                time_s=chimney.current_time,
+                Q_advection=Q_adv,
+                Q_wall_total=Q_wall,
+                Q_latent=Q_lat,
+                T_inlet=float(new_temperatures[0]),
+                T_outlet=float(new_temperatures[-1]),
+                T_gas_mean=float(np.mean(new_temperatures)),
+                T_wall_mean=float(np.mean(chimney.T_wall[step])),
+            )
+
         return new_temperatures

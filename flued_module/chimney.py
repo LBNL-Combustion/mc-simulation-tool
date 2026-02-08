@@ -8,6 +8,7 @@ from typing import List, Dict, Any, Optional
 from .physics import PhysicalProperties
 from .comprehensive_heat_transfer import ComprehensiveHeatTransfer
 from .coupled_solver import CoupledFlowThermalSolver
+from .diagnostics_recorder import DiagnosticsRecorder
 from .early_diagnostics import EarlyTimeDiagnostics
 from .chimney_geometry_plot import plot_chimney_geometry, plot_chimney_snapshot
 from .wind_cap_effects import WindCapConfig, wind_cap_deltaP
@@ -523,6 +524,7 @@ class Chimney:
                  door_temp_dilution: Optional[Dict[str, Any]] = None,
                  room_pressure_offset_Pa: float = 0.0,
                  leakage_config: Optional[Dict[str, Any]] = None,
+                 enable_diagnostics: bool = False,
                  verbose: bool = False):
         """Initialize chimney simulation
 
@@ -677,11 +679,16 @@ class Chimney:
         # Initialize catalytic bypass damper
         self._initialize_catalytic_bypass(catalytic_bypass)
 
+        # Initialize diagnostics recorder (default off)
+        self.diagnostics_recorder = DiagnosticsRecorder(enable=enable_diagnostics)
+
         # Initialize coupled solver if requested
         # Coupled solver iterates between flow and thermal equations for consistency
         self.use_coupled_solver = use_coupled_solver
         if use_coupled_solver:
-            self.coupled_solver = CoupledFlowThermalSolver()
+            self.coupled_solver = CoupledFlowThermalSolver(
+                diagnostics=self.diagnostics_recorder
+            )
             self.convergence_history = []  # Track convergence metrics for debugging
             
         # Initialize early diagnostics

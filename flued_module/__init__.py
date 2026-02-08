@@ -11,8 +11,9 @@ in chimney and flue systems.
 from .chimney import Chimney
 from .mass_flow import MassFlow
 from .physics import PhysicalProperties
+from .diagnostics_recorder import DiagnosticsRecorder
 
 __version__ = "1.0.0"
 __author__ = "Converted from FLUESIM5.BAS"
 
-__all__ = ["Chimney", "MassFlow", "PhysicalProperties"]
+__all__ = ["Chimney", "MassFlow", "PhysicalProperties", "DiagnosticsRecorder"]
