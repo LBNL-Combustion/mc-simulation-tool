@@ -13,8 +13,15 @@ through the building envelope, computed via an orifice model:
     mdot_in = Cd * A_room_leak * sqrt(2 * rho * |P_amb - P_room|)
 
 Default: OFF.  Enable via Chimney(room_plenum={...}).
+
+Numerical method: adaptive subcycling with forward Euler.
+The orifice leak-in model creates stiff dynamics (large gain at small
+depressurization), so the global chimney dt (e.g. 0.5s) is often too
+large for stability.  We estimate the local stability limit and
+subcycle automatically.
 """
 import numpy as np
+from math import ceil, sqrt
 from dataclasses import dataclass
 
 
@@ -64,8 +71,41 @@ class RoomPlenum:
         self.P_room_gauge = self.cfg.P_room_init_Pa
         self._history.clear()
 
+    def _leak_in_mdot(self, P_gauge, P_ambient):
+        """Compute leak-in mass flow for a given gauge pressure.
+
+        Returns positive mdot when room is depressurized (P_gauge < 0),
+        meaning air flows INTO the room from outdoors.
+        """
+        dP_envelope = -P_gauge  # positive when room is below ambient
+        rho_outdoor = P_ambient / (R_AIR * self.cfg.T_room_K)
+        if abs(dP_envelope) < 1e-12:
+            return 0.0
+        sign = 1.0 if dP_envelope > 0 else -1.0
+        return (self.cfg.Cd_room * self.cfg.A_room_leak_m2
+                * sign * sqrt(2.0 * rho_outdoor * abs(dP_envelope)))
+
+    def _stable_dt(self, P_ambient):
+        """Estimate maximum stable forward-Euler timestep.
+
+        The stiffest regime is near P_gauge ~ 0 (small depressurization,
+        large d(mdot_in)/dP).  We evaluate the gain at |P_gauge| = P_ref
+        (a small reference pressure) and require dt * gain < 1.
+        """
+        P_ref = max(abs(self.P_room_gauge), 0.5)  # Pa, floor at 0.5 Pa
+        rho = P_ambient / (R_AIR * self.cfg.T_room_K)
+        # d(mdot_in)/d(P_gauge) at P_ref (magnitude):
+        #   |d/dP [Cd*A*sqrt(2*rho*|P|)]| = Cd*A*rho / sqrt(2*rho*P_ref)
+        dmdot_dP = (self.cfg.Cd_room * self.cfg.A_room_leak_m2
+                    * rho / sqrt(2.0 * rho * P_ref))
+        G = R_AIR * self.cfg.T_room_K / self.cfg.V_room_m3  # Pa per (kg/s) per s
+        gain = G * dmdot_dP  # 1/s
+        if gain < 1e-6:
+            return 10.0  # effectively no limit
+        return 0.8 / gain  # safety factor 0.8
+
     def update(self, mdot_chimney: float, P_ambient: float, dt: float) -> float:
-        """Advance room pressure by one timestep.
+        """Advance room pressure by one timestep with adaptive subcycling.
 
         Args:
             mdot_chimney: Mass flow rate drawn by chimney [kg/s].
@@ -80,30 +120,26 @@ class RoomPlenum:
         if not self.cfg.enable:
             return 0.0
 
-        # Room absolute pressure
-        P_room_abs = P_ambient + self.P_room_gauge
+        # Determine subcycling
+        dt_stable = self._stable_dt(P_ambient)
+        n_sub = max(1, int(ceil(dt / dt_stable)))
+        dt_sub = dt / n_sub
 
-        # Air leaking INTO room from outdoors through building envelope
-        # Orifice model: mdot_in = Cd * A * sqrt(2 * rho * |dP|)
-        dP_envelope = P_ambient - P_room_abs  # positive when room is depressurized
-        rho_outdoor = P_ambient / (R_AIR * self.cfg.T_room_K)
-        mdot_in = (self.cfg.Cd_room * self.cfg.A_room_leak_m2
-                   * np.sign(dP_envelope)
-                   * np.sqrt(2.0 * rho_outdoor * abs(dP_envelope)))
+        for _ in range(n_sub):
+            mdot_in = self._leak_in_mdot(self.P_room_gauge, P_ambient)
 
-        # Net mass flow into room = leakage in - chimney draw
-        mdot_net = mdot_in - mdot_chimney
+            # Net mass flow into room = leakage in - chimney draw
+            mdot_net = mdot_in - mdot_chimney
 
-        # dP_room/dt = mdot_net * R_air * T_room / V_room
-        dP_dt = mdot_net * R_AIR * self.cfg.T_room_K / self.cfg.V_room_m3
+            # dP_room/dt = mdot_net * R_air * T_room / V_room
+            dP_dt = mdot_net * R_AIR * self.cfg.T_room_K / self.cfg.V_room_m3
 
-        # Forward Euler
-        self.P_room_gauge += dP_dt * dt
+            # Forward Euler substep
+            self.P_room_gauge += dP_dt * dt_sub
 
-        # Clamp: room can't go more than ~100 Pa below ambient in practice
-        self.P_room_gauge = max(self.P_room_gauge, -100.0)
-        # Room can't be significantly above ambient either (doors/windows open)
-        self.P_room_gauge = min(self.P_room_gauge, 50.0)
+            # Clamp to physically reasonable range
+            self.P_room_gauge = max(self.P_room_gauge, -50.0)
+            self.P_room_gauge = min(self.P_room_gauge, 50.0)
 
         self._history.append(self.P_room_gauge)
 
