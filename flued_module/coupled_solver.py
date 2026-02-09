@@ -1124,6 +1124,15 @@ class CoupledFlowThermalSolver:
                     # Stable formulation: new temperature based on upstream and heat loss
                     T_steady = T_upstream - q_total_loss * residence_time / (gas_mass * cp)
 
+                    # Bound T_steady to physical range: gas temperature must stay
+                    # between upstream and wall temperatures.  Without this, small
+                    # |mass_flow| near flow reversal causes residence_time to blow
+                    # up and T_steady to diverge to +/-infinity.
+                    T_bound_lo = min(T_upstream, T_wall) - 1.0
+                    T_bound_hi = max(T_upstream, T_wall) + 1.0
+                    T_steady = max(T_steady, T_bound_lo)
+                    T_steady = min(T_steady, T_bound_hi)
+
                     # Apply relaxation toward steady state
                     tau_thermal = gas_mass * cp / (abs(mass_flow) * cp + h_inner * area)
                     alpha = dt / (tau_thermal + dt)
@@ -1142,8 +1151,9 @@ class CoupledFlowThermalSolver:
                 dT_dt = (T_wall - temperatures[seg]) / tau
                 new_temperatures[seg] = temperatures[seg] + dT_dt * dt
             
-            # Enforce physical bounds for all segments except inlet
-            if seg > 0:
+            # Enforce physical bounds for non-inlet segments
+            # (inlet boundary temperature is set by the fire/appliance and may be very hot)
+            if not is_inlet_boundary:
                 T_min_physical = part.T_ambient_K
                 T_max_physical = 1073.15  # 800°C max
 
