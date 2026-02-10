@@ -9,6 +9,7 @@ import logging
 from .flow.elbows import base_K
 from .mass_flow import calculate_leakage_mass_flow, calculate_accel_pressure_loss
 from .diagnostics_recorder import DiagnosticsRecorder
+from ._perf_counters import COUNTERS as _PC  # TEMP: profiling
 
 @dataclass
 class MomentumConfig:
@@ -294,6 +295,8 @@ class CoupledFlowThermalSolver:
                 self.logger.debug(f"Accepting partial convergence at iteration {iteration+1}")
                 break
         
+        _PC['picard_iterations'] += metrics.iterations  # TEMP: profiling
+
         # Update chimney state with final values
         chimney.T_gas[step] = current_state['temperatures']
         chimney.mass_flow_rate[step] = current_state['mass_flow']

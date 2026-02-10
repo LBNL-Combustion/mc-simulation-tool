@@ -313,18 +313,23 @@ def plot_time_simulation_snapshots(chimney, num_snapshots: int = 6,
                                    facecolor=gas_color, edgecolor='none')
                 ax.add_patch(gas_rect)
                 
-                # Simplified triple wall drawing
-                thicknesses = [0.02, 0.04, 0.02]  # Display thicknesses
+                # Use actual part thicknesses with minimum display size
+                min_layer_thickness = 0.02 * r_inner
+                thicknesses = [
+                    max(part.thickness_inner_m, min_layer_thickness),
+                    max(part.thickness_middle_m, min_layer_thickness * 2),
+                    max(part.thickness_outer_m, min_layer_thickness),
+                ]
                 temps = [T_liner_C, T_middle_C, T_outer_C]
                 r_current = r_inner
-                
+
                 for t_idx, (thick, temp) in enumerate(zip(thicknesses, temps)):
                     color = cmap((temp - T_min) / (T_max - T_min + 1e-6))
-                    for x in [-r_current - thick * r_inner, r_current]:
-                        rect = Rectangle((x, y_bottom), thick * r_inner, seg_height,
+                    for x in [-r_current - thick, r_current]:
+                        rect = Rectangle((x, y_bottom), thick, seg_height,
                                        facecolor=color, edgecolor='black', linewidth=0.5)
                         ax.add_patch(rect)
-                    r_current += thick * r_inner
+                    r_current += thick
         
         # Set axis properties
         max_radius = max(part.outer_diameter_m / 2 * 1.2 for part in chimney.parts)

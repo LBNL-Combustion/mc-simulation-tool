@@ -16,7 +16,8 @@ class EarlyTimeDiagnostics:
     def check_timestep(self, step: int, time: float, T_gas: np.ndarray, 
                       T_wall: np.ndarray, T_liner: np.ndarray = None,
                       T_middle: np.ndarray = None, T_outer: np.ndarray = None,
-                      mass_flow: float = 0, dt: float = 0):
+                      mass_flow: float = 0, dt: float = 0,
+                      elbow_losses: dict = None, friction_losses: dict = None):
         """
         Check for unphysical behavior at each timestep
         """
@@ -59,17 +60,76 @@ class EarlyTimeDiagnostics:
             # Check gas cooling rate (need previous values)
             # This would need to be implemented with history
             
-        # Check mass flow
+        # Check mass flow - negative flow is valid (backdraft condition)
+        # Only flag as info, not error, since backdraft simulation is intentional
         if mass_flow < 0:
-            self.errors.append(f"Negative mass flow: {mass_flow} kg/s")
+            self.warnings.append(f"Backdraft detected: mass_flow = {mass_flow*1000:.2f} g/s")
             
-        # Only print critical errors, not every warning
-        if self.errors and "CRITICAL" in str(self.errors):
-            print(f"\n*** CRITICAL ERROR at t={time:.1f}s (step {step}) ***")
+        # Check elbow losses if provided
+        if elbow_losses is not None:
+            self._check_elbow_losses(elbow_losses, friction_losses)
+            
+        # Print immediate warnings for early timesteps
+        if step < 10 and (self.errors or self.warnings):
+            print(f"\n*** Diagnostics at t={time:.1f}s (step {step}) ***")
             for error in self.errors:
-                if "CRITICAL" in error:
-                    print(f"ERROR: {error}")
+                print(f"ERROR: {error}")
+            for warning in self.warnings:
+                print(f"WARNING: {warning}")
                 
+    def _check_elbow_losses(self, elbow_losses: dict, friction_losses: dict = None):
+        """
+        Check elbow pressure losses for physical reasonableness
+        
+        Args:
+            elbow_losses: Dict with 'K_total', 'Le_total', 'dp_minor' 
+            friction_losses: Optional dict with 'dp_friction' for comparison
+        """
+        # Check K values
+        if 'K_total' in elbow_losses:
+            K_total = elbow_losses['K_total']
+            if K_total < 0:
+                self.errors.append(f"Negative total K value: {K_total}")
+            elif K_total > 100:
+                self.warnings.append(f"Unusually high total K value: {K_total}")
+        
+        # Check equivalent lengths
+        if 'Le_total' in elbow_losses:
+            Le_total = elbow_losses['Le_total']
+            if Le_total < 0:
+                self.errors.append(f"Negative total equivalent length: {Le_total}m")
+            elif Le_total > 100:
+                self.warnings.append(f"Unusually high equivalent length: {Le_total}m")
+        
+        # Check pressure drops
+        if 'dp_minor' in elbow_losses:
+            dp_minor = elbow_losses['dp_minor']
+            if dp_minor < 0:
+                self.errors.append(f"Negative elbow pressure drop: {dp_minor} Pa")
+            elif dp_minor > 10000:  # 10 kPa is very high for elbow losses
+                self.warnings.append(f"Very high elbow pressure drop: {dp_minor:.0f} Pa")
+            
+            # Compare with friction losses if available
+            if friction_losses and 'dp_friction' in friction_losses:
+                dp_friction = friction_losses['dp_friction']
+                if dp_friction > 0:
+                    ratio = dp_minor / dp_friction
+                    if ratio > 20:
+                        self.warnings.append(
+                            f"Elbow losses dominate: {ratio:.1f}x friction losses"
+                        )
+                    elif ratio < 0.01 and dp_minor > 0:
+                        self.warnings.append(
+                            f"Elbow losses negligible: only {ratio*100:.1f}% of friction"
+                        )
+        
+        # Check for NaN or Inf
+        for key, value in elbow_losses.items():
+            if np.isnan(value):
+                self.errors.append(f"NaN detected in elbow {key}")
+            elif np.isinf(value):
+                self.errors.append(f"Inf detected in elbow {key}")
+    
     def get_report(self) -> str:
         """Get diagnostic report"""
         if not self.errors and not self.warnings:

@@ -213,7 +213,14 @@ class StableTripleWallSolver:
             
         R_conv_inner = 1 / (h_inner * A_gas)
         R_conv_outer = 1 / (h_outer * A_3)
-        
+
+        # Combined gas-to-liner resistance (convection + liner conduction in SERIES)
+        # Heat must flow through convection first, then through the liner metal
+        R_gas_to_liner = R_conv_inner + R_cond_1
+
+        # Combined middle-to-ambient resistance (outer conduction + convection in SERIES)
+        R_middle_to_ambient = R_cond_3 + R_conv_outer
+
         # Radiation resistances between layers
         if hasattr(properties['liner'], 'emissivity') and hasattr(properties['middle'], 'emissivity'):
             R_rad_1_2 = self.radiation_resistance(r_1, r_2, 
@@ -246,39 +253,40 @@ class StableTripleWallSolver:
         eps = 1e-10
         
         # Use conductances (1/R) with bounds to prevent infinity
-        G_conv_inner = 1/(R_conv_inner + eps)
-        G_conv_outer = 1/(R_conv_outer + eps)
-        G_cond_1 = 1/(R_cond_1 + eps)
-        G_cond_2 = 1/(R_cond_2 + eps)
-        G_cond_3 = 1/(R_cond_3 + eps)
+        # CRITICAL FIX: Convection + liner conduction are in SERIES for gas-to-liner path
+        # For series resistances: G_total = 1/(R1 + R2), NOT G1 + G2
+        G_gas_to_liner = 1/(R_gas_to_liner + eps)  # Combined: gas convection + liner conduction
+        G_cond_2 = 1/(R_cond_2 + eps)              # Insulation conduction (liner to middle)
+        G_cond_3 = 1/(R_cond_3 + eps)              # Outer wall conduction (middle to outer)
+        G_conv_outer = 1/(R_conv_outer + eps)      # Outer convection (outer to ambient)
         G_rad_1_2 = 1/(R_rad_1_2 + eps) if R_rad_1_2 < float('inf') else 0
         G_rad_2_3 = 1/(R_rad_2_3 + eps) if R_rad_2_3 < float('inf') else 0
-        
-        # Liner node
-        K[0, 0] = G_conv_inner + G_cond_1 + G_cond_2 + G_rad_1_2
+
+        # Liner node: receives heat from gas (through combined R_conv + R_liner), loses to middle
+        # Heat path: T_gas -> (R_conv + R_liner in series) -> T_liner -> (R_insulation) -> T_middle
+        K[0, 0] = G_gas_to_liner + G_cond_2 + G_rad_1_2
         K[0, 1] = -(G_cond_2 + G_rad_1_2)
         K[0, 2] = 0
-        
-        # Middle node
+
+        # Middle node: receives from liner (through insulation), loses to outer (through outer wall)
         K[1, 0] = -(G_cond_2 + G_rad_1_2)
         K[1, 1] = G_cond_2 + G_rad_1_2 + G_cond_3 + G_rad_2_3
         K[1, 2] = -(G_cond_3 + G_rad_2_3)
-        
-        # Outer node
+
+        # Outer node: receives from middle (through outer wall), loses to ambient (convection)
         K[2, 0] = 0
         K[2, 1] = -(G_cond_3 + G_rad_2_3)
         K[2, 2] = G_cond_3 + G_rad_2_3 + G_conv_outer
-        
+
         # Capacitance matrix
         C = np.diag([C_1, C_2, C_3])
-        
+
         # Source vector (external heat sources only)
-        # The convection boundary conditions are handled in the K matrix
-        # Q contains only the external temperature forcing terms
+        # Use the combined conductance for gas boundary, regular for ambient
         Q = np.array([
-            G_conv_inner * T_gas,      # Heat from gas
-            0,                         # No external source for middle layer
-            G_conv_outer * T_ambient   # Heat from ambient
+            G_gas_to_liner * T_gas,    # Heat from gas (through combined series resistance)
+            0,                          # No external source for middle layer
+            G_conv_outer * T_ambient   # Heat to ambient (convection only)
         ])
         
         # Old temperature vector
@@ -353,10 +361,22 @@ class StableTripleWallSolver:
                 
                 raise np.linalg.LinAlgError("Matrix contains inf/nan")
             
-            # Skip expensive condition number check - just add regularization
-            # This saves significant computation time
-            reg_factor = 1e-10 * np.max(np.abs(np.diag(A_matrix)))
-            A_matrix += reg_factor * np.eye(3)
+            # Check condition number and provide diagnostics
+            try:
+                cond = np.linalg.cond(A_matrix)
+                if cond > 1e10:
+                    print(f"Warning: Poor matrix conditioning = {cond:.2e}")
+                    # Diagnose the issue
+                    diag_C = np.diag(C)
+                    diag_K = np.diag(K)
+                    print(f"  Capacitances: {diag_C}")
+                    print(f"  Conductances: {diag_K}")
+                    finite_K = diag_K[np.isfinite(diag_K)]
+                    if len(finite_K) > 0:
+                        print(f"  dt = {dt}, min(C)/max(finite_K) = {np.min(diag_C)/np.max(finite_K):.3e}")
+            except:
+                # If condition number fails, just continue
+                pass
             
             # Solve system
             T_new_scaled = np.linalg.solve(A_matrix, b_vector)

@@ -11,6 +11,7 @@ Config flag: include_interlayer_radiation (default True).
 import numpy as np
 from math import pi, log, ceil
 from typing import Dict, Tuple, Optional
+from ._perf_counters import COUNTERS as _PC  # TEMP: profiling
 
 STEFAN_BOLTZMANN = 5.67e-8  # W/(m^2 K^4)
 
@@ -166,6 +167,8 @@ class AdaptiveTripleWallSolver:
         # Otherwise, use sub-stepping
         n_substeps = int(ceil(dt_global / dt_required))
         dt_sub = dt_global / n_substeps
+        _PC['triple_wall_substep_events'] += 1        # TEMP: profiling
+        _PC['triple_wall_total_substeps'] += n_substeps  # TEMP: profiling
 
         # Initialize temperatures
         T_liner = T_liner_old

@@ -1,0 +1,190 @@
+{
+  "materials": {
+    "steel_24_gauge": {
+      "density_kg_m3": 7850,
+      "thermal_conductivity_W_m_K": 50,
+      "specific_heat_J_kg_K": 460,
+      "emissivity": 0.8,
+      "roughness_m": 0.00015,
+      "common_thickness_m": 0.00076,
+      "description": "24 gauge galvanized steel"
+    },
+    "stainless_316": {
+      "density_kg_m3": 8000,
+      "thermal_conductivity_W_m_K": 16,
+      "specific_heat_J_kg_K": 500,
+      "emissivity": 0.35,
+      "roughness_m": 0.000001,
+      "common_thickness_m": 0.0005,
+      "description": "316 stainless steel, lightly oxidized"
+    },
+    "stainless_430": {
+      "density_kg_m3": 7850,
+      "thermal_conductivity_W_m_K": 26,
+      "specific_heat_J_kg_K": 460,
+      "emissivity": 0.35,
+      "roughness_m": 0.000001,
+      "common_thickness_m": 0.0005,
+      "description": "430 stainless steel, lightly oxidized"
+    },
+    "aluminum": {
+      "density_kg_m3": 2700,
+      "thermal_conductivity_W_m_K": 237,
+      "specific_heat_J_kg_K": 900,
+      "emissivity": 0.09,
+      "roughness_m": 0.0000015,
+      "common_thickness_m": 0.001,
+      "description": "Aluminum, polished"
+    },
+    "corrugated_316_light": {
+      "density_kg_m3": 8000,
+      "thermal_conductivity_W_m_K": 16,
+      "specific_heat_J_kg_K": 500,
+      "emissivity": 0.8,
+      "roughness_m": 0.003,
+      "corrugation_depth_m": 0.003,
+      "corrugation_pitch_m": 0.012,
+      "common_thickness_m": 0.00015,
+      "description": "Light corrugated 316 SS liner, 3mm corrugations"
+    },
+    "corrugated_316_heavy": {
+      "density_kg_m3": 8000,
+      "thermal_conductivity_W_m_K": 16,
+      "specific_heat_J_kg_K": 500,
+      "emissivity": 0.8,
+      "roughness_m": 0.006,
+      "corrugation_depth_m": 0.006,
+      "corrugation_pitch_m": 0.025,
+      "common_thickness_m": 0.00025,
+      "description": "Heavy corrugated 316 SS liner, 6mm corrugations"
+    },
+    "corrugated_aluminum": {
+      "density_kg_m3": 2700,
+      "thermal_conductivity_W_m_K": 237,
+      "specific_heat_J_kg_K": 900,
+      "emissivity": 0.3,
+      "roughness_m": 0.004,
+      "corrugation_depth_m": 0.004,
+      "corrugation_pitch_m": 0.018,
+      "common_thickness_m": 0.0002,
+      "description": "Corrugated aluminum flex liner"
+    },
+    "air": {
+  "density_kg_m3": 1.20,
+  "thermal_conductivity_W_m_K": 0.026,
+  "specific_heat_J_kg_K": 1005,
+  "emissivity": null,
+  "common_thickness_m": 0.0254,
+  "description": "Air gap (1 inch)"
+    },
+    "ceramic_fiber": {
+      "density_kg_m3": 100,
+      "thermal_conductivity_W_m_K": 0.04,
+      "specific_heat_J_kg_K": 1050,
+      "emissivity": 0.75,
+      "roughness_m": null,
+      "common_thickness_m": 0.025,
+      "description": "Ceramic fiber insulation blanket"
+    },
+    "mineral_wool": {
+      "density_kg_m3": 100,
+      "thermal_conductivity_W_m_K": 0.03,
+      "specific_heat_J_kg_K": 840,
+      "emissivity": 0.75,
+      "roughness_m": null,
+      "common_thickness_m": 0.025,
+      "description": "Mineral wool insulation"
+    },
+    "vermiculite": {
+      "density_kg_m3": 120,
+      "thermal_conductivity_W_m_K": 0.058,
+      "specific_heat_J_kg_K": 840,
+      "emissivity": 0.7,
+      "common_thickness_m": 0.025,
+      "description": "Vermiculite insulation"
+    }
+  },
+  "pipe_configurations": {
+    "single_wall": {
+      "description": "Single wall pipe configuration",
+      "layers": ["wall"],
+      "example_materials": {
+        "wall": "steel_24_gauge"
+      }
+    },
+    "triple_wall": {
+      "description": "Triple wall insulated pipe with air gaps",
+      "layers": ["inner_liner", "insulation",  "outer_shell"],
+      "example_materials": {
+        "inner_liner": "stainless_316",
+        "insulation": "ceramic_fiber",
+        "outer_shell": "stainless_430"
+      },
+      "typical_air_gaps_m": {
+        "inner_air_gap": 0.003,
+        "outer_air_gap": 0.003
+      }
+    }
+  },
+  "surface_properties": {
+    "roughness_m": {
+      "smooth_stainless": 1e-6,
+      "galvanized_steel": 1.5e-4,
+      "cast_iron": 2.5e-4,
+      "corroded_steel": 5e-4
+    },
+    "condensate_film_thickness_m": {
+      "typical": 5e-5,
+      "maximum": 1e-4,
+      "vertical_smooth": 5e-5,
+      "vertical_rough": 8e-5,
+      "horizontal_bottom": 1e-4,
+      "inclined": 7e-5
+    }
+  },
+  "seam_configurations": {
+    "welded": {
+      "K_loss": 0.0,
+      "spacing_m": null,
+      "description": "Fully welded seams, no additional resistance"
+    },
+    "spiral_lock": {
+      "K_loss": 0.02,
+      "spacing_m": 0.3,
+      "description": "Spiral lock seam every 30cm"
+    },
+    "snap_lock": {
+      "K_loss": 0.05,
+      "spacing_m": 1.2,
+      "description": "Snap-lock joints every 4 ft section"
+    },
+    "crimped": {
+      "K_loss": 0.03,
+      "spacing_m": 1.2,
+      "description": "Crimped joints every 4 ft"
+    },
+    "gasketed": {
+      "K_loss": 0.08,
+      "spacing_m": 1.2,
+      "description": "Gasketed joints with step"
+    }
+  },
+  "condensation_properties": {
+    "steel_24_gauge": {
+      "max_film_thickness_m": 5e-5,
+      "description": "Typical for vertical galvanized steel"
+    },
+    "stainless_316": {
+      "max_film_thickness_m": 3e-5,
+      "description": "Smooth surface allows thinner film"
+    },
+    "stainless_430": {
+      "max_film_thickness_m": 3e-5,
+      "description": "Smooth surface allows thinner film"
+    },
+    "aluminum": {
+      "max_film_thickness_m": 2e-5,
+      "description": "Very smooth, hydrophobic surface"
+    }
+  }
+}

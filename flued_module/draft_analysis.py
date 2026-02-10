@@ -5,6 +5,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
+from .flow.elbows import base_K
 
 @dataclass
 class DraftResults:
@@ -61,7 +62,7 @@ class DraftAnalyzer:
                 T_ambient = part.T_ambient_K
                 P_ambient = part.Pa
                 
-                rho_gas = self.chimney.physics.air_density(T_gas, P_ambient)
+                rho_gas = self.chimney.density[step, seg]
                 rho_ambient = self.chimney.physics.air_density(T_ambient, P_ambient)
                 
                 # Buoyancy pressure for this segment
@@ -80,11 +81,13 @@ class DraftAnalyzer:
                         f = self._friction_factor(Re, part.roughness_m / diameter)
                         dp_friction = f * (segment_height / diameter) * 0.5 * rho_gas * velocity**2
                         
-                        # Add fitting losses if applicable
-                        if part.has_fittings and local_seg == 0:
-                            K_fitting = 0.5  # Minor loss coefficient
-                            dp_fitting = K_fitting * 0.5 * rho_gas * velocity**2
-                            dp_friction += dp_fitting
+                        # Add fitting losses from actual elbow specs
+                        elbow_key = (part_idx, local_seg)
+                        if hasattr(self.chimney, 'segment_elbows') and elbow_key in self.chimney.segment_elbows:
+                            for elbow_spec in self.chimney.segment_elbows[elbow_key]:
+                                K_fitting = base_K(elbow_spec) * elbow_spec.vane_factor
+                                dp_fitting = K_fitting * 0.5 * rho_gas * velocity**2
+                                dp_friction += dp_fitting
                         
                         cumulative_loss += dp_friction
             
@@ -94,8 +97,7 @@ class DraftAnalyzer:
             
             # Theoretical velocity from available draft (Bernoulli)
             if available_draft[step] > 0 and step > 0:
-                avg_density = np.mean([self.chimney.physics.air_density(T, part.Pa) 
-                                     for T, part in zip(self.chimney.T_gas[step], self.chimney.parts)])
+                avg_density = np.mean(self.chimney.density[step])
                 draft_velocity[step] = np.sqrt(2 * available_draft[step] / avg_density)
         
         return DraftResults(
@@ -251,10 +253,11 @@ class DraftAnalyzer:
         # Add theoretical line
         T_ambient = self.chimney.parts[0].T_ambient_K - 273.15
         T_range = np.linspace(T_ambient, avg_gas_temp.max(), 100)
-        rho_ambient = self.chimney.physics.air_density(T_ambient + 273.15, 101325)
+        P_ambient = self.chimney.parts[0].Pa
+        rho_ambient = self.chimney.physics.air_density(T_ambient + 273.15, P_ambient)
         theoretical_draft = []
         for T in T_range:
-            rho_gas = self.chimney.physics.air_density(T + 273.15, 101325)
+            rho_gas = self.chimney.physics.air_density(T + 273.15, P_ambient)
             dp = self.g * results.stack_height * (rho_ambient - rho_gas)
             theoretical_draft.append(dp)
         
@@ -323,16 +326,21 @@ class DraftAnalyzer:
         # Calculate required draft for different flow rates
         print(f"\nRequired Draft Analysis:")
         target_flows = [0.005, 0.01, 0.02, 0.05]  # kg/s
-        avg_density = np.mean([self.chimney.physics.air_density(T, 101325) 
-                             for T in self.chimney.T_gas[-1]])
+        avg_density = np.mean(self.chimney.density[-1])
         
+        # Use actual loss ratio from simulation results
+        if results.available_draft[-1] > 0:
+            loss_ratio = results.total_draft[-1] / results.available_draft[-1]
+        else:
+            loss_ratio = 2.0  # Fallback if no available draft
+
         for mdot in target_flows:
             # Calculate required velocity
             avg_area = np.mean([part.inner_area_m2 for part in self.chimney.parts])
             v_required = mdot / (avg_density * avg_area)
-            
-            # Estimate required draft (simplified)
-            dp_required = 0.5 * avg_density * v_required**2 * 2  # Factor of 2 for losses
+
+            # Estimate required draft using actual loss ratio from simulation
+            dp_required = 0.5 * avg_density * v_required**2 * loss_ratio
             
             print(f"  For {mdot:.3f} kg/s: Need ~{dp_required:.1f} Pa "
                   f"({'ACHIEVABLE' if dp_required < results.available_draft[-1] else 'NOT ACHIEVABLE'})")

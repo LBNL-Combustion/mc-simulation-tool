@@ -11,6 +11,7 @@ from .adaptive_triple_wall import AdaptiveTripleWallSolver
 #from .energy_diagnostics import EnergyDiagnostics
 import logging
 import warnings
+from ._perf_counters import COUNTERS as _PC  # TEMP: profiling
 
 @dataclass
 class FlowProperties:
@@ -725,6 +726,8 @@ class ComprehensiveHeatTransfer:
         Returns:
             Dictionary with updated temperatures and heat transfer coefficients
         """
+        _PC['ht_kernel_calls'] += 1  # TEMP: profiling
+
         # EXTRACT INPUT DATA
         T_gas = segment_data['gas_temperature']  # Hot gas temperature (K)
         T_ambient = segment_data['ambient_temperature']  # Outside air temperature (K)
@@ -940,6 +943,8 @@ class ComprehensiveHeatTransfer:
             
             if residual < tolerance and humidity_residual < tolerance:
                 break
+
+        _PC['condensation_iters_total'] += iteration + 1  # TEMP: profiling
 
         # Apply spiral corrugation heat transfer enhancement (v2.0)
         # This multiplier is pre-computed during preprocessing and stored in part.corrugation_effects

@@ -1,9 +1,181 @@
 """
 Mass flow and pressure calculations for chimney simulation
 Based on algorithms from FLUESIM5.BAS mass.flow and pres.param subroutines
+
+Extended with:
+- Colebrook-White friction factor (optional)
+- Distributed leakage (VENT-II-style)
+- Acceleration/deceleration loss terms
 """
 import numpy as np
 from .physics import PhysicalProperties
+
+
+# =============================================================================
+# FRICTION FACTOR CALCULATIONS (Part C)
+# =============================================================================
+
+def friction_factor(Re: float, rel_rough: float = 0.0, method: str = "current") -> float:
+    """Calculate Darcy friction factor
+
+    Supports two methods:
+    - "current": Existing Blasius (smooth) / Swamee-Jain (rough) correlations
+    - "colebrook": Iterative Colebrook-White solution (more accurate for turbulent flow)
+
+    Args:
+        Re: Reynolds number (dimensionless)
+        rel_rough: Relative roughness ε/D (dimensionless), default 0.0 for smooth
+        method: "current" or "colebrook"
+
+    Returns:
+        Darcy friction factor (dimensionless)
+    """
+    # Laminar flow: always use f = 64/Re regardless of method
+    if Re < 2300:
+        return 64.0 / max(Re, 1.0)
+
+    # Turbulent flow
+    if method == "colebrook":
+        return _friction_factor_colebrook(Re, rel_rough)
+    else:
+        # Current method: Blasius (smooth) or Swamee-Jain (rough)
+        return _friction_factor_current(Re, rel_rough)
+
+
+def _friction_factor_current(Re: float, rel_rough: float) -> float:
+    """Current friction factor method: Blasius (smooth) / Swamee-Jain (rough)
+
+    Args:
+        Re: Reynolds number (turbulent, Re >= 2300)
+        rel_rough: Relative roughness ε/D
+
+    Returns:
+        Darcy friction factor
+    """
+    if rel_rough < 1e-6:
+        # Blasius correlation for smooth pipes
+        return 0.316 / Re**0.25
+    else:
+        # Swamee-Jain explicit approximation for rough pipes
+        return 0.25 / (np.log10(rel_rough/3.7 + 5.74/Re**0.9))**2
+
+
+def _friction_factor_colebrook(Re: float, rel_rough: float) -> float:
+    """Colebrook-White iterative friction factor solution
+
+    Solves: 1/sqrt(f) = -2.0*log10( (ε/D)/3.7 + 2.51/(Re*sqrt(f)) )
+
+    Args:
+        Re: Reynolds number (turbulent, Re >= 2300)
+        rel_rough: Relative roughness ε/D
+
+    Returns:
+        Darcy friction factor
+    """
+    # Initial guess
+    f = 0.02
+
+    # Iterative solution
+    for _ in range(30):
+        f_old = f
+        # Colebrook-White equation rearranged for f_new
+        # 1/sqrt(f) = -2*log10( rel_rough/3.7 + 2.51/(Re*sqrt(f)) )
+        sqrt_f = np.sqrt(f)
+        rhs = -2.0 * np.log10(rel_rough/3.7 + 2.51/(Re * sqrt_f))
+        f_new = 1.0 / (rhs**2) if rhs != 0 else f
+
+        # Clamp to physical range
+        f = np.clip(f_new, 1e-4, 1.0)
+
+        # Check convergence
+        if abs(f - f_old) < 1e-8:
+            break
+
+    return f
+
+
+# =============================================================================
+# DISTRIBUTED LEAKAGE CALCULATIONS (Part A - VENT-II Style)
+# =============================================================================
+
+def calculate_leakage_mass_flow(P_gauge: float, A_leak_m2: float, Cd_leak: float,
+                                 rho_ambient: float, rho_gas: float) -> float:
+    """Calculate leakage mass flow at a segment joint/location
+
+    VENT-II style leakage model:
+    - If P_gauge > 0: gas pressure above ambient → leaking OUT (uses rho_ambient)
+    - If P_gauge < 0: gas pressure below ambient → leaking IN (uses rho_gas)
+
+    Args:
+        P_gauge: Local gauge pressure P_segment - P_ambient [Pa]
+        A_leak_m2: Leakage area [m²]
+        Cd_leak: Discharge coefficient for leakage (default 0.61)
+        rho_ambient: Ambient air density [kg/m³]
+        rho_gas: Local gas density [kg/m³]
+
+    Returns:
+        Signed leakage mass flow [kg/s]:
+        - Negative: leakage OUT (reduces downstream mass flow)
+        - Positive: leakage IN (adds to downstream mass flow)
+    """
+    if A_leak_m2 <= 0:
+        return 0.0
+
+    # Select reference density based on pressure difference direction (VENT-II logic)
+    if P_gauge > 0:
+        # Leaking OUT: use ambient density (gas expands to ambient)
+        rho_ref = rho_ambient
+    else:
+        # Leaking IN: use gas density (ambient air enters and heats up)
+        rho_ref = rho_gas
+
+    # Orifice flow: m_dot = Cd * A * sqrt(2 * rho * |ΔP|)
+    dP_abs = abs(P_gauge)
+    m_leak_magnitude = Cd_leak * A_leak_m2 * np.sqrt(2.0 * rho_ref * dP_abs)
+
+    # Sign convention:
+    # +ΔP (above ambient) → outflow → subtract from downstream → negative
+    # -ΔP (below ambient) → inflow → add to downstream → positive
+    m_leak_signed = -np.sign(P_gauge) * m_leak_magnitude
+
+    return m_leak_signed
+
+
+# =============================================================================
+# ACCELERATION/DECELERATION LOSS (Part B)
+# =============================================================================
+
+def calculate_accel_pressure_loss(rho_upstream: float, v_upstream: float,
+                                   rho_downstream: float, v_downstream: float,
+                                   C_accel: float = 1.0) -> float:
+    """Calculate pressure loss due to velocity head change between segments
+
+    Steady loss term representing acceleration/deceleration:
+        dp_accel = C_accel * (q_downstream - q_upstream)
+    where q = 0.5 * rho * v²
+
+    Sign convention:
+    - If velocity increases downstream → positive dp_accel → additional loss
+    - If velocity decreases downstream → negative dp_accel → recovery
+
+    Args:
+        rho_upstream: Gas density at upstream segment [kg/m³]
+        v_upstream: Gas velocity at upstream segment [m/s]
+        rho_downstream: Gas density at downstream segment [kg/m³]
+        v_downstream: Gas velocity at downstream segment [m/s]
+        C_accel: Acceleration loss coefficient (default 1.0)
+
+    Returns:
+        Pressure loss [Pa] (positive = loss opposing flow)
+    """
+    # Velocity heads (dynamic pressure)
+    q_upstream = 0.5 * rho_upstream * v_upstream**2
+    q_downstream = 0.5 * rho_downstream * v_downstream**2
+
+    # Acceleration loss: change in velocity head
+    dp_accel = C_accel * (q_downstream - q_upstream)
+
+    return dp_accel
 
 class MassFlow:
     """Mass flow and pressure calculations for flue systems"""
@@ -52,67 +224,12 @@ class MassFlow:
         """
         return loss_coefficient * (density * velocity**2) / 2
     
-    def entrance_loss_coefficient(self, geometry='sharp'):
-        """Get entrance loss coefficient
-        
-        Args:
-            geometry: 'sharp', 'rounded', or 'bell_mouth'
-            
-        Returns:
-            Loss coefficient (dimensionless)
-        """
-        coefficients = {
-            'sharp': 0.5,
-            'rounded': 0.1,
-            'bell_mouth': 0.05
-        }
-        return coefficients.get(geometry, 0.5)
-    
-    def exit_loss_coefficient(self):
-        """Get exit loss coefficient
-        
-        Returns:
-            Loss coefficient (dimensionless) - typically 1.0
-        """
-        return 1.0
-    
-    def elbow_loss_coefficient(self, angle_degrees, diameter, radius_curvature=None):
-        """Calculate elbow loss coefficient
-        
-        Args:
-            angle_degrees: Bend angle in degrees
-            diameter: Pipe diameter (m)
-            radius_curvature: Radius of curvature (m), if None uses 1.5*diameter
-            
-        Returns:
-            Loss coefficient (dimensionless)
-        """
-        if radius_curvature is None:
-            radius_curvature = 1.5 * diameter
-        
-        # Ratio of radius to diameter
-        r_over_d = radius_curvature / diameter
-        
-        # Base loss coefficient for 90-degree bend
-        if r_over_d >= 2:
-            K_90 = 0.2
-        elif r_over_d >= 1:
-            K_90 = 0.35
-        else:
-            K_90 = 0.5
-        
-        # Scale for actual angle
-        angle_factor = (angle_degrees / 90) ** 1.5
-        
-        return K_90 * angle_factor
-    
-    def calculate_mass_flow_rate(self, driving_pressure, total_resistance, density):
+    def calculate_mass_flow_rate(self, driving_pressure, total_resistance):
         """Calculate mass flow rate from driving pressure and system resistance
         
         Args:
             driving_pressure: Net driving pressure (Pa)
             total_resistance: Total system flow resistance (Pa·s²/kg²)
-            density: Average fluid density (kg/m³)
             
         Returns:
             Mass flow rate (kg/s)
@@ -179,138 +296,3 @@ class MassFlow:
         draft = self.buoyancy_pressure(chimney_height, rho_ambient, rho_gas)
         
         return draft
-    
-    def wind_pressure_effect(self, wind_speed, wind_direction_deg, chimney_height, 
-                           building_height=None, pressure_coefficients=None):
-        """Calculate wind pressure effects on chimney draft
-        
-        Args:
-            wind_speed: Wind speed (m/s)
-            wind_direction_deg: Wind direction relative to building (degrees)
-            chimney_height: Chimney height above ground (m)
-            building_height: Building height (m), default is chimney_height * 0.5
-            pressure_coefficients: Dict with 'windward' and 'leeward' coefficients
-            
-        Returns:
-            Wind pressure difference (Pa)
-        """
-        if building_height is None:
-            building_height = chimney_height * 0.5
-        
-        if pressure_coefficients is None:
-            pressure_coefficients = {'windward': 0.8, 'leeward': -0.5}
-        
-        # Dynamic pressure
-        rho_air = self.physics.air_density(288.15)  # Standard air density
-        q_wind = 0.5 * rho_air * wind_speed**2
-        
-        # Height factor for wind speed variation
-        if chimney_height > building_height:
-            height_factor = (chimney_height / building_height) ** 0.15
-        else:
-            height_factor = 1.0
-        
-        # Pressure difference due to wind
-        delta_p_wind = q_wind * height_factor * (
-            pressure_coefficients['windward'] - pressure_coefficients['leeward']
-        )
-        
-        # Direction factor (simplified)
-        direction_factor = abs(np.cos(np.radians(wind_direction_deg)))
-        
-        return delta_p_wind * direction_factor
-    
-    def flow_network_solver(self, nodes, connections, boundary_conditions, max_iterations=50, tolerance=1e-6):
-        """Solve flow network using iterative method
-        
-        Args:
-            nodes: Dictionary of node properties
-            connections: List of connection dictionaries with flow resistance
-            boundary_conditions: Dictionary of known pressures or flows
-            max_iterations: Maximum number of iterations
-            tolerance: Convergence tolerance for pressure residuals
-            
-        Returns:
-            Dictionary with solved pressures and flow rates
-        """
-        # This is a simplified network solver
-        # In practice, this would implement the full matrix solution as in FLUESIM5
-        
-        n_nodes = len(nodes)
-        n_connections = len(connections)
-        
-        # Initialize pressures and flows
-        pressures = np.zeros(n_nodes)
-        flows = np.zeros(n_connections)
-        
-        # Apply boundary conditions for pressures
-        for node_id, pressure in boundary_conditions.get('pressures', {}).items():
-            if node_id < n_nodes:
-                pressures[node_id] = pressure
-        
-        # Iterative solution
-        for iteration in range(max_iterations):
-            old_pressures = pressures.copy()
-            
-            # Update flows based on current pressures
-            for i, conn in enumerate(connections):
-                node_from = conn['from_node']
-                node_to = conn['to_node']
-                resistance = conn['resistance']
-                
-                dp = pressures[node_from] - pressures[node_to]
-                flows[i] = np.sign(dp) * np.sqrt(abs(dp) / resistance) if resistance > 0 else 0
-            
-            # Update pressures based on flow continuity
-            # (Simplified - full implementation would use matrix methods)
-            for i in range(n_nodes):
-                if i not in boundary_conditions.get('pressures', {}):
-                    # Sum flows in and out of node
-                    flow_sum = 0
-                    for j, conn in enumerate(connections):
-                        if conn['to_node'] == i:
-                            flow_sum += flows[j]
-                        elif conn['from_node'] == i:
-                            flow_sum -= flows[j]
-                    
-                    # Pressure correction (simplified)
-                    pressures[i] += 0.1 * flow_sum
-            
-            # Check convergence
-            residual = np.max(np.abs(pressures - old_pressures))
-            if residual < tolerance:
-                break
-        
-        return {
-            'pressures': pressures,
-            'flows': flows,
-            'iterations': iteration + 1,
-            'converged': residual < tolerance
-        }
-    
-    def equivalent_leakage_area(self, flow_rate, pressure_difference, reference_pressure=10.0, exponent=0.5):
-        """Calculate equivalent leakage area
-        
-        Args:
-            flow_rate: Flow rate (m³/s)
-            pressure_difference: Pressure difference (Pa)
-            reference_pressure: Reference pressure for ELA calculation (Pa)
-            exponent: Flow exponent (typically 0.5 for turbulent flow)
-            
-        Returns:
-            Equivalent leakage area (m²)
-        """
-        if pressure_difference <= 0:
-            return 0.0
-        
-        # Standard air density
-        rho = self.physics.air_density(293.15)  # 20°C
-        
-        # Flow coefficient
-        C = flow_rate / (pressure_difference ** exponent)
-        
-        # ELA at reference pressure
-        reference_flow = C * (reference_pressure ** exponent)
-        ela = reference_flow / np.sqrt(2 * reference_pressure / rho)
-        
-        return ela

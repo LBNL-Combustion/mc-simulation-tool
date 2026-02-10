@@ -15,6 +15,8 @@ from .chimney_geometry_plot import plot_chimney_geometry, plot_chimney_snapshot
 from .wind_cap_effects import WindCapConfig, wind_cap_deltaP
 from .flow.elbows import base_K
 import pandas as pd
+import time as _time                       # TEMP: profiling timer
+from ._perf_counters import COUNTERS as _PC, reset as _pc_reset, summary as _pc_summary  # TEMP: profiling
 
 @dataclass
 class InletRestrictionConfig:
@@ -802,12 +804,17 @@ class Chimney:
         print(f"Starting comprehensive heat transfer simulation:")
         print(f"  {self.total_segments} segments, {self.time_steps} time steps")
         print(f"  Time step: {self.dt}s, Total time: {self.total_time}s")
-        
+
+        # TEMP: profiling -- reset counters and start wall-clock timer
+        _pc_reset()
+        _t0 = _time.perf_counter()
+
         # MAIN TIME LOOP - advance from t=dt to t=total_time
         for step in range(1, self.time_steps + 1):
             # Update simulation state
             self.time_step = step
             self.current_time = step * self.dt
+            _PC['timesteps'] += 1  # TEMP: profiling
 
             # STEP 0: UPDATE DOOR OPENING (if dynamic door control enabled)
             # This updates effective area before physics calculations
@@ -927,7 +934,11 @@ class Chimney:
                     print(f"  [WIND CAP] V={V_current:.1f} m/s, cap={self._wind_cfg.cap_type}, dP={dP:+.2f} Pa ({sign_str})")
                 
         print("Comprehensive simulation completed successfully")
-        
+
+        # TEMP: profiling -- print performance summary
+        _elapsed = _time.perf_counter() - _t0
+        print(_pc_summary(_elapsed))
+
         # Run conservation diagnostics
         self.check_conservation()
     #Done
