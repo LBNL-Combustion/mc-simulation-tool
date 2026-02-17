@@ -1,0 +1,140 @@
+{
+  "_description": "Sample config for run_simulation(). This represents a typical 15ft chimney: 6-inch diameter, single-wall black pipe indoors, 90-degree elbow, horizontal triple-wall through the wall, then vertical triple-wall outdoors.",
+
+  "parts": [
+    {
+      "_name": "Black pipe (indoor vertical)",
+      "type": "single",
+      "inner_diameter_ft": 0.5,
+      "height_ft": 6.125,
+      "z_ft": 0,
+      "orientation": "vertical",
+      "T_ambient_K": 295.15,
+      "Pa": 98457,
+      "num_segments": 6,
+      "thickness_w_m": 0.00076,
+      "density_w_kg_m3": 7850,
+      "cp_w_J_kg_K": 460,
+      "k_w_W_m_K": 50,
+      "epsilon_w": 0.8,
+      "roughness_m": 0.00015
+    },
+    {
+      "_name": "Horizontal insulated pipe (through wall)",
+      "type": "triple",
+      "inner_diameter_ft": 0.5,
+      "height_ft": 1.9375,
+      "z_ft": 0,
+      "orientation": "horizontal",
+      "T_ambient_K": 275.15,
+      "Pa": 98596,
+      "num_segments": 2,
+      "thickness_inner_m": 0.0005,
+      "density_inner_kg_m3": 7850,
+      "cp_inner_J_kg_K": 460,
+      "k_inner_W_m_K": 26,
+      "epsilon_inner": 0.35,
+      "thickness_middle_m": 0.025,
+      "density_middle_kg_m3": 100,
+      "cp_middle_J_kg_K": 1050,
+      "k_middle_W_m_K": 0.04,
+      "thickness_outer_m": 0.0005,
+      "density_outer_kg_m3": 8000,
+      "cp_outer_J_kg_K": 500,
+      "k_outer_W_m_K": 16,
+      "epsilon_outer": 0.35,
+      "air_gap_inner_m": 0.0,
+      "air_gap_outer_m": 0.0,
+      "roughness_m": 1e-6
+    },
+    {
+      "_name": "Vertical insulated pipe (outdoors)",
+      "type": "triple",
+      "inner_diameter_ft": 0.5,
+      "height_ft": 5.917,
+      "z_ft": 0,
+      "orientation": "vertical",
+      "T_ambient_K": 275.15,
+      "Pa": 98596,
+      "num_segments": 8,
+      "thickness_inner_m": 0.0005,
+      "density_inner_kg_m3": 7850,
+      "cp_inner_J_kg_K": 460,
+      "k_inner_W_m_K": 26,
+      "epsilon_inner": 0.35,
+      "thickness_middle_m": 0.025,
+      "density_middle_kg_m3": 100,
+      "cp_middle_J_kg_K": 1050,
+      "k_middle_W_m_K": 0.04,
+      "thickness_outer_m": 0.0005,
+      "density_outer_kg_m3": 8000,
+      "cp_outer_J_kg_K": 500,
+      "k_outer_W_m_K": 16,
+      "epsilon_outer": 0.35,
+      "air_gap_inner_m": 0.0,
+      "air_gap_outer_m": 0.0,
+      "roughness_m": 1e-6
+    }
+  ],
+
+  "elbows": [
+    {
+      "type": "tee",
+      "between_parts": [-1, 0],
+      "diameter_ft": 0.5,
+      "vertical_length_ft": 1.0,
+      "horizontal_length_ft": 0.5417,
+      "T_ambient_K": 295.15
+    },
+    {
+      "type": "elbow",
+      "between_parts": [0, 1],
+      "diameter_ft": 0.5,
+      "height_ft": 0.625,
+      "width_ft": 0.7083,
+      "angle_deg": 90,
+      "R_over_D": 1.5,
+      "elbow_type": "long_radius",
+      "T_ambient_K": 295.15
+    },
+    {
+      "type": "tee",
+      "between_parts": [1, 2],
+      "diameter_ft": 0.5,
+      "vertical_length_ft": 1.0,
+      "horizontal_length_ft": 0.5417,
+      "T_ambient_K": 275.15
+    }
+  ],
+
+  "dt": 0.5,
+  "total_time": 600,
+
+  "inlet_restriction": {
+    "enable": true,
+    "door_type": "swivel",
+    "door_width_ft": 1.2708,
+    "door_height_ft": 0.8229,
+    "Cd": 0.62,
+    "A_leak_m2": 0.0125,
+    "inlet_area_min_m2": 0.003,
+    "K_stove": 0.0
+  },
+
+  "door_schedule": [[0, 100], [90, 100], [95, 50], [300, 50], [305, 0]],
+
+  "_door_schedule_notes": "Wide open 0-90s, ramp to 50% at 90-95s, hold cracked until 300s, then close. Use a constant like 100.0 for always-open.",
+
+  "inlet_temp_profile": [
+    [0, 473],
+    [60, 523],
+    [120, 548],
+    [180, 523],
+    [300, 473],
+    [600, 423]
+  ],
+
+  "_inlet_temp_notes": "Inlet gas temperature in Kelvin over time. Typical wood stove: ramps up to ~275C, then cools. Use a single number like 473.15 for constant temperature.",
+
+  "verbose": false
+}
