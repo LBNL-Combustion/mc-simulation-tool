@@ -1,153 +1,130 @@
-# PyFluesim - Chimney Heat Transfer and Draft Simulation
+# flued_dynamics
 
-A Python package for simulating heat transfer, mass flow, and pressure dynamics in chimney and flue systems. Converted from the original FLUESIM5.BAS program developed by Scanada Consultants Limited.
+Transient 1-D simulation of heat transfer, buoyancy-driven flow, and pressure in residential chimney/flue systems.
 
-## Features
+## What it does
 
-- **Heat Transfer Modeling**: Transient heat transfer in chimney walls and gas flow
-- **Mass Flow Calculations**: Buoyancy-driven flow with pressure loss calculations
-- **Segmented Analysis**: Divide chimney parts into multiple segments for detailed analysis
-- **Visualization**: Temperature profile plots showing gas and wall temperatures
-- **Flexible Configuration**: Support for multiple chimney parts with different properties
+Given a chimney geometry (pipe dimensions, materials, insulation, fittings) and boundary conditions (ambient temperatures, inlet gas temperature, door schedule, wind), the solver marches forward in time computing:
 
-## Installation
+- Gas and wall temperatures along the flow path
+- Mass flow rate (buoyancy-driven with friction, minor losses, and optional inlet restriction)
+- Pressure distribution through the stack
+- Condensation risk (dew point tracking)
 
-1. **Install Dependencies**:
-   ```bash
-   pip install numpy matplotlib
-   ```
-   
-   Or using the requirements file:
-   ```bash
-   pip install -r requirements.txt
-   ```
+The chimney is discretized into segments. Each timestep couples the momentum equation (quasi-steady with first-order lag) to the energy equation via Picard iteration.
 
-2. **Add to Python Path** (if not installing as package):
-   ```python
-   import sys
-   sys.path.append('path/to/pyfluesim')
-   ```
-
-## Usage
-
-### Basic Example
-
-```python
-from pyfluesim import Chimney
-
-# Define chimney configuration
-parts = [
-    {
-        'type': 'single',
-        'inner_diameter_ft': 4/12,  # 4 inches in feet
-        'height_ft': 7.5,
-        'z_m': 0,
-        'thickness_w_m': 0.00076,
-        'orientation': 'vertical',
-        'density_w_kg_m3': 7850,  # steel
-        'cp_w_J_kg_K': 460,       # steel specific heat
-        'k_w_W_m_K': 50,          # steel thermal conductivity
-        'film_w': 5.08e-5,
-        'epsilon_w': 0.8,
-        'T_ambient_K': 294.15,    # 21°C
-        'Pa': 101325,
-        'num_segments': 5,
-    }
-]
-
-# Create and run simulation
-chimney = Chimney(parts=parts, dt=0.5, total_time=60)
-chimney.run_simulation(save_interval=1)
-
-# View results
-chimney.plot_temperature_profiles()
-summary = chimney.get_summary_data()
-print(f"Final temperature range: {summary['final_gas_temp_range_C']}")
-```
-
-### Configuration Parameters
-
-Each part in the `parts` list should contain:
-
-- **type**: 'single' (chimney type)
-- **inner_diameter_ft**: Inner diameter in feet
-- **height_ft**: Height in feet  
-- **z_m**: Elevation above reference in meters
-- **thickness_w_m**: Wall thickness in meters
-- **orientation**: 'vertical' or 'horizontal'
-- **density_w_kg_m3**: Wall material density (kg/m³)
-- **cp_w_J_kg_K**: Wall material specific heat (J/kg·K)
-- **k_w_W_m_K**: Wall thermal conductivity (W/m·K)
-- **film_w**: Max condensate film thickness (m)
-- **epsilon_w**: Wall emissivity (0-1)
-- **T_ambient_K**: Ambient temperature (K)
-- **Pa**: Atmospheric pressure (Pa)
-- **num_segments**: Number of segments for this part
-
-### Accessing Results
-
-```python
-# Temperature arrays (time_steps x segments)
-gas_temps = chimney.T_gas      # Gas temperatures (K)
-wall_temps = chimney.T_wall    # Inner wall temperatures (K)
-outer_temps = chimney.T_outer  # Outer wall temperatures (K)
-
-# Flow properties
-mass_flows = chimney.mass_flow_rate  # Mass flow rate vs time (kg/s)
-velocities = chimney.velocity        # Velocities (m/s)
-pressures = chimney.pressure         # Pressures (Pa)
-
-# Time array
-times = chimney.time_array  # Time points (s)
-```
-
-## Package Structure
-
-```
-pyfluesim/
-├── __init__.py          # Package initialization
-├── chimney.py           # Main Chimney class
-├── physics.py           # Physical properties and correlations
-├── heat_transfer.py     # Heat transfer calculations
-└── mass_flow.py         # Mass flow and pressure calculations
-```
-
-## Algorithm Background
-
-This package implements algorithms from the original FLUESIM5.BAS program:
-
-- **Heat Transfer**: Finite difference method for transient heat transfer
-- **Mass Flow**: Buoyancy-driven flow with pressure network analysis
-- **Physical Properties**: Temperature-dependent air properties
-- **Segmentation**: Divides chimney into segments for spatial resolution
-
-## Testing
-
-Run the basic test to verify installation:
+## Quick start
 
 ```bash
-python test_basic.py
+pip install numpy scipy matplotlib
 ```
 
-Run the full example:
+```python
+from flued_module import Chimney
+
+parts = [...]   # list of pipe section dicts (see sample_config.json)
+elbows = [...]  # fittings between parts
+
+ch = Chimney(
+    parts=parts,
+    elbows=elbows,
+    dt=1.0,
+    total_time=600,
+    use_coupled_solver=True,
+)
+ch.run_simulation()
+
+# Results: ch.T_gas, ch.T_wall, ch.velocity, ch.pressure, ch.mass_flow_rate
+# All are numpy arrays, shape (time_steps+1, total_segments) or (time_steps+1,)
+```
+
+## CLI runner
+
+`run_simulation.py` takes a JSON config and returns results as JSON. Useful for calling from a front end or other language.
 
 ```bash
-python example_usage.py
+python run_simulation.py sample_config.json --output results.json
 ```
 
-## Original FLUESIM5 Reference
+See `sample_config.json` for the full schema with a 15ft chimney example including door schedule and inlet temperature ramp.
 
-Based on FLUESIM5.BAS - Dynamic analysis program for furnace and flue transient performance, Version 5.0 (December 1989) developed by Scanada Consultants Limited for Canada Mortgage and Housing Corporation.
+## Pipe types
+
+**Single wall** -- bare steel pipe (indoor sections, typically 24-gauge black stovepipe):
+```python
+{'type': 'single', 'inner_diameter_ft': 0.5, 'height_ft': 6.125,
+ 'orientation': 'vertical', 'T_ambient_K': 295, 'Pa': 98457,
+ 'num_segments': 6, ...}
+```
+
+**Triple wall** -- insulated chimney pipe (liner / ceramic fiber / outer shell):
+```python
+{'type': 'triple', 'inner_diameter_ft': 0.5, 'height_ft': 5.917,
+ 'orientation': 'vertical', 'T_ambient_K': 275, 'Pa': 98457,
+ 'num_segments': 8,
+ 'k_inner_W_m_K': 26, 'k_middle_W_m_K': 0.04, 'k_outer_W_m_K': 16, ...}
+```
+
+`MaterialProperties` can build these dicts from material names:
+```python
+from flued_module.material_properties import MaterialProperties
+mp = MaterialProperties('flued_module/data/pipe_props.json')
+part = mp.create_triple_wall_chimney_part(
+    inner_diameter_ft=0.5, height_ft=5.917,
+    inner_material='stainless_430', middle_material='ceramic_fiber',
+    outer_material='stainless_316', orientation='vertical',
+    T_ambient_K=275, Pa=98457, num_segments=8)
+```
+
+## Fittings
+
+Elbows and tees go in the `elbows` list. Each specifies which parts it connects and its geometry. Pressure loss uses K-factors; the thermal model optionally absorbs fitting length/mass into adjacent segments (`fittings_thermal` parameter).
+
+## Inlet restriction and door schedule
+
+The `inlet_restriction` dict models a stove door as a variable-area inlet. Pass a `door_opening_func` that returns percent open as a function of time:
+
+```python
+def door_func(t):
+    if t < 90: return 100.0    # wide open
+    if t < 300: return 11.7    # cracked to 2 inches
+    return 0.0                 # closed (leakage only)
+
+ch = Chimney(..., door_opening_func=door_func,
+             inlet_restriction={'enable': True, 'A_leak_m2': 0.0125, ...})
+```
+
+## Solver parameters
+
+The coupled solver uses Picard iteration with adaptive relaxation and a quasi-steady momentum model. Two parameters control how fast the flow responds to transients:
+
+- `solver_relaxation` -- Picard under-relaxation factor (default 0.3)
+- `solver_alpha_cap` -- max fraction of steady-state step per timestep (default 0.5)
+
+```python
+ch = Chimney(..., solver_relaxation=0.5, solver_alpha_cap=1.0)
+```
+
+## Module layout
+
+```
+flued_module/
+    __init__.py
+    chimney.py                  # Chimney class, simulation loop, pressure profiles
+    coupled_solver.py           # CoupledFlowThermalSolver (momentum + energy coupling)
+    physics.py                  # Air properties, Nu/Re correlations
+    comprehensive_heat_transfer.py  # Wall heat transfer (convection + radiation)
+    stable_triple_wall.py       # Triple-wall steady-state thermal resistance
+    adaptive_triple_wall.py     # Triple-wall transient solver with inter-layer radiation
+    elbows.py                   # Fitting K-factors and geometry
+    condensation.py             # Dew point and condensation tracking
+    material_properties.py      # Material database, part builders
+    data/pipe_props.json        # Material property tables
+run_simulation.py               # CLI/Python entry point (JSON in, JSON out)
+sample_config.json              # Example configuration
+```
 
 ## Requirements
 
-- Python 3.6+
-- numpy >= 1.20.0
-- matplotlib >= 3.3.0
-
-## Notes
-
-- The simulation uses explicit finite difference methods for temperature updates
-- Mass flow calculations are simplified compared to the full BASIC version
-- For production use, consider validating results against experimental data
-- The original BASIC code contained extensive pressure network solving - this Python version implements a simplified approach suitable for single-chimney analysis
+- Python 3.8+
+- numpy, scipy, matplotlib
