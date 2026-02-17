@@ -8,7 +8,7 @@ This package provides tools for simulating heat transfer, mass flow, and pressur
 in chimney and flue systems.
 """
 
-from .chimney import Chimney
+from .chimney import Chimney, make_smooth_door_schedule
 from .mass_flow import MassFlow
 from .physics import PhysicalProperties
 from .diagnostics_recorder import DiagnosticsRecorder
@@ -25,4 +25,5 @@ __all__ = [
     "DiagnosticsRecorder",
     "MomentumConfig",
     "RoomPlenumConfig",
+    "make_smooth_door_schedule",
 ]

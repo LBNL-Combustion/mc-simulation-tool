@@ -37,15 +37,11 @@ class AdaptiveTripleWallSolver:
         self._geometry_cache: Dict[int, Dict] = {}
 
     def _get_geometry_constants(self, geometry: Dict, properties: Dict) -> Dict:
-        """
-        Get or compute cached geometry constants for a segment.
-        These values are constant for a given segment and don't change
-        during simulation.
-        """
-        # Create a cache key from geometry, material properties, and radiation flag
+        """Get or compute cached geometry constants for a segment."""
         cache_key = (
             geometry['inner_diameter'],
             geometry['length'],
+            geometry.get('extra_wall_Cj', 0.0),
             properties['liner'].thickness,
             properties['middle'].thickness,
             properties['outer'].thickness,
@@ -59,7 +55,6 @@ class AdaptiveTripleWallSolver:
         if cache_key_hash in self._geometry_cache:
             return self._geometry_cache[cache_key_hash]
 
-        # Compute all geometry constants once
         r_gas = geometry['inner_diameter'] / 2
         length = geometry['length']
 
@@ -82,6 +77,8 @@ class AdaptiveTripleWallSolver:
         C_1 = properties['liner'].density * properties['liner'].specific_heat * V_1
         C_2 = properties['middle'].density * properties['middle'].specific_heat * V_2
         C_3 = properties['outer'].density * properties['outer'].specific_heat * V_3
+        # Add absorbed fitting steel mass to innermost wall node
+        C_1 += geometry.get('extra_wall_Cj', 0.0)
 
         # Conduction resistances (cylindrical)
         R_12 = log(r_2 / r_1) / (2 * pi * properties['middle'].thermal_conductivity * length)
@@ -152,7 +149,6 @@ class AdaptiveTripleWallSolver:
         Returns:
             Tuple of (T_liner_new, T_middle_new, T_outer_new)
         """
-        # Get precomputed constants
         consts = self._get_geometry_constants(geometry, properties)
         dt_required = consts['dt_required']
 
@@ -170,7 +166,6 @@ class AdaptiveTripleWallSolver:
         _PC['triple_wall_substep_events'] += 1        # TEMP: profiling
         _PC['triple_wall_total_substeps'] += n_substeps  # TEMP: profiling
 
-        # Initialize temperatures
         T_liner = T_liner_old
         T_middle = T_middle_old
         T_outer = T_outer_old
@@ -194,7 +189,6 @@ class AdaptiveTripleWallSolver:
         Includes inter-layer radiation via linearized conductance.
         Uses Python min/max instead of np.clip for scalar values.
         """
-        # Extract precomputed constants
         A_gas = consts['A_gas']
         A_3 = consts['A_3']
         C_1 = consts['C_1']
@@ -247,7 +241,7 @@ class AdaptiveTripleWallSolver:
         dT3_dt = (Q_outer_from_middle - Q_outer_ambient) / C_3
         T_outer_new = T_outer_old + dT3_dt * dt
 
-        # Apply physical bounds using Python min/max (faster than np.clip for scalars)
+        # Physical bounds: passive system, monotonic T_gas >= T_liner >= T_middle >= T_outer >= T_ambient
         T_liner_new = max(T_ambient, min(T_gas, T_liner_new))
         T_middle_new = max(T_ambient, min(T_liner_new, T_middle_new))
         T_outer_new = max(T_ambient, min(T_middle_new, T_outer_new))

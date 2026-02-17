@@ -26,7 +26,6 @@ def plot_chimney_geometry(chimney, timesteps_to_plot: Optional[List[int]] = None
         wall_scale: Factor to scale wall thickness for visibility (default 5x)
     """
     
-    # Select timesteps to plot
     if timesteps_to_plot is None:
         # Sample 20 frames evenly throughout simulation
         n_frames = min(20, chimney.time_steps)
@@ -38,8 +37,6 @@ def plot_chimney_geometry(chimney, timesteps_to_plot: Optional[List[int]] = None
     y_pos = 0.0  # Current y position (bottom of current section)
     
     for part_idx, part in enumerate(chimney.parts):
-        z_start = part.z_m
-        
         for local_seg in range(part.num_segments):
             seg_height = part.height_m / part.num_segments
             
@@ -90,7 +87,6 @@ def plot_chimney_geometry(chimney, timesteps_to_plot: Optional[List[int]] = None
         else:  # horizontal
             x_pos += part.height_m
     
-    # Set up figure and axis
     fig, ax = plt.subplots(figsize=figsize)
     
     # Calculate plot bounds
@@ -141,7 +137,6 @@ def plot_chimney_geometry(chimney, timesteps_to_plot: Optional[List[int]] = None
                                facecolor='red', edgecolor='none')
             gas_patches.append(gas_rect)
     
-    # Add all patches to the plot
     for patch in wall_patches:
         ax.add_patch(patch)
     for patch in gas_patches:
@@ -208,7 +203,6 @@ def plot_chimney_geometry(chimney, timesteps_to_plot: Optional[List[int]] = None
         
         return wall_patches + gas_patches + [title]
     
-    # Create animation
     anim = animation.FuncAnimation(fig, update, frames=len(timesteps_to_plot),
                                   interval=1000/fps, blit=True)
     
@@ -234,7 +228,6 @@ def plot_chimney_snapshot(chimney, timestep: int, figsize: Tuple[float, float] =
         save_path: Optional path to save the figure
     """
     
-    # Use the same geometry calculation as the animation
     segment_geometries = []
     x_pos = 0.0
     y_pos = 0.0

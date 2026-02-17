@@ -37,15 +37,12 @@ def plot_time_simulation(chimney, timesteps_to_plot: Optional[list] = None,
     for seg in range(chimney.total_segments):
         part_idx, local_seg, part = chimney.get_segment_info(seg)
         seg_height = part.height_m / part.num_segments
-        bottom = part.z_m + local_seg * seg_height
-        center = bottom + seg_height / 2
+        center = chimney.segment_elevations[seg]
         segment_heights.append(seg_height)
         segment_centers.append(center)
     
-    # Create figure
     fig, ax = plt.subplots(figsize=figsize)
-    
-    # Color map for temperature
+
     cmap = plt.cm.hot
     
     # Temperature range for consistent coloring
@@ -262,7 +259,6 @@ def plot_time_simulation_snapshots(chimney, num_snapshots: int = 6,
     T_min = chimney.parts[0].T_ambient_K - 273.15
     T_max = np.max(chimney.T_gas) - 273.15
     
-    # Color map
     cmap = plt.cm.hot
     
     for idx, step in enumerate(timesteps):
@@ -278,7 +274,7 @@ def plot_time_simulation_snapshots(chimney, num_snapshots: int = 6,
             
             # Segment geometry
             seg_height = part.height_m / part.num_segments
-            y_bottom = part.z_m + local_seg * seg_height
+            y_bottom = chimney.segment_elevations[seg] - seg_height / 2
             y_top = y_bottom + seg_height
             
             # Radial positions
@@ -343,7 +339,6 @@ def plot_time_simulation_snapshots(chimney, num_snapshots: int = 6,
         if idx % cols == 0:  # Left column
             ax.set_ylabel('Height (m)')
     
-    # Remove unused subplots
     for idx in range(num_snapshots, len(axes_flat)):
         fig.delaxes(axes_flat[idx])
     

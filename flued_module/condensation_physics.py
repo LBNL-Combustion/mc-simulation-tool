@@ -33,7 +33,6 @@ class CondensationPhysics:
     RHO_LIQUID_WATER = 1000.0  # kg/m³ - density of liquid water
     
     def __init__(self):
-        """Initialize condensation physics calculator"""
         pass
     
     def saturation_pressure(self, T_K: float) -> float:
@@ -79,7 +78,6 @@ class CondensationPhysics:
         if T_C < 0:
             return self.H_FG_REF  # Use reference value for ice
         else:
-            # Temperature-dependent latent heat
             return self.H_FG_REF + (self.CP_WATER_VAPOR - self.CP_LIQUID_WATER) * T_C
     
     def mole_fraction_to_humidity_ratio(self, x_water: float) -> float:
@@ -319,7 +317,6 @@ class CondensationPhysics:
         # Total latent heat effect
         net_latent_heat = Q_cond + Q_evap  # Q_evap is negative
         
-        # Return updated state
         return CondensationState(
             film_thickness=new_film_thickness,
             film_mass=new_film_mass,

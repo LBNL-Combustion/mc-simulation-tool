@@ -47,6 +47,19 @@ htmlcov/
 .tox/
 .nox/
 
+# Generated outputs
+outputs/
+*.png
+
+# Development notebooks/scripts (keep in repo but separate from module)
+notebooks/
+examples/
+docs/
+tests/
+
+# Dev-only plotting helpers (not tracked)
+flued_module/chimney_plots.py
+
 # Misc
 *.log
 *.tmp

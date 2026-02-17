@@ -143,7 +143,6 @@ def wind_cap_deltaP(Pa: float, T_out_K: float, V_wind: float,
     V_wind = max(V_wind, 0.0)  # No negative wind speeds
     T_out_K = max(min(T_out_K, 350.0), 180.0)  # Clamp temperature to reasonable range
 
-    # Calculate air density at outlet
     rho = air_density(Pa, T_out_K)
 
     # Dynamic pressure

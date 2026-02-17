@@ -37,19 +37,15 @@ class DraftAnalyzer:
         n_steps = self.chimney.time_steps + 1
         n_segments = self.chimney.total_segments
         
-        # Initialize arrays
         total_draft = np.zeros(n_steps)
         segment_draft = np.zeros((n_steps, n_segments))
         available_draft = np.zeros(n_steps)
         draft_velocity = np.zeros(n_steps)
         pressure_losses = np.zeros(n_steps)
         
-        # Calculate total stack height
         stack_height = sum(part.height_m for part in self.chimney.parts)
-        
-        # For each timestep
+
         for step in range(n_steps):
-            # Calculate segment-by-segment draft
             cumulative_draft = 0
             cumulative_loss = 0
             
@@ -57,7 +53,6 @@ class DraftAnalyzer:
                 part_idx, local_seg, part = self.chimney.get_segment_info(seg)
                 segment_height = part.height_m / part.num_segments
                 
-                # Gas and ambient densities
                 T_gas = self.chimney.T_gas[step, seg]
                 T_ambient = part.T_ambient_K
                 P_ambient = part.Pa
@@ -65,17 +60,14 @@ class DraftAnalyzer:
                 rho_gas = self.chimney.density[step, seg]
                 rho_ambient = self.chimney.physics.air_density(T_ambient, P_ambient)
                 
-                # Buoyancy pressure for this segment
                 dp_buoyancy = self.g * segment_height * (rho_ambient - rho_gas)
                 segment_draft[step, seg] = dp_buoyancy
                 cumulative_draft += dp_buoyancy
                 
-                # Calculate pressure losses
-                if step > 0:  # Skip first timestep (no flow yet)
+                if step > 0:
                     velocity = self.chimney.velocity[step, seg]
                     diameter = part.inner_diameter_m
                     
-                    # Friction loss
                     if abs(velocity) > 0.01:
                         Re = rho_gas * abs(velocity) * diameter / self.chimney.physics.air_viscosity(T_gas)
                         f = self._friction_factor(Re, part.roughness_m / diameter)
@@ -153,7 +145,7 @@ class DraftAnalyzer:
         drafts = []
         for seg in range(results.segment_draft.shape[1]):
             part_idx, local_seg, part = self.chimney.get_segment_info(seg)
-            height = part.z_m + (local_seg + 0.5) * part.height_m / part.num_segments
+            height = self.chimney.segment_elevations[seg]
             heights.append(height)
             drafts.append(results.segment_draft[final_step, seg])
         
@@ -193,7 +185,6 @@ class DraftAnalyzer:
         # Plot 4: Efficiency and Performance
         ax4 = axes[1, 1]
         
-        # Calculate efficiency (available/total draft)
         efficiency = np.zeros_like(results.total_draft)
         mask = results.total_draft > 1  # Avoid division by very small numbers
         efficiency[mask] = results.available_draft[mask] / results.total_draft[mask] * 100
@@ -240,8 +231,7 @@ class DraftAnalyzer:
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
         fig.suptitle('Draft vs Temperature Analysis', fontsize=14)
         
-        # Calculate average gas temperature for each timestep
-        avg_gas_temp = np.mean(self.chimney.T_gas - 273.15, axis=1)  # Convert to °C
+        avg_gas_temp = np.mean(self.chimney.T_gas - 273.15, axis=1)
         
         # Plot 1: Draft vs Average Gas Temperature
         ax1.scatter(avg_gas_temp, results.total_draft, alpha=0.6, s=20)
@@ -323,7 +313,6 @@ class DraftAnalyzer:
         print(f"  Average Gas Temperature: {avg_gas_temp:.1f}°C")
         print(f"  Temperature Drop: {inlet_temp - outlet_temp:.1f}°C")
         
-        # Calculate required draft for different flow rates
         print(f"\nRequired Draft Analysis:")
         target_flows = [0.005, 0.01, 0.02, 0.05]  # kg/s
         avg_density = np.mean(self.chimney.density[-1])
@@ -335,7 +324,6 @@ class DraftAnalyzer:
             loss_ratio = 2.0  # Fallback if no available draft
 
         for mdot in target_flows:
-            # Calculate required velocity
             avg_area = np.mean([part.inner_area_m2 for part in self.chimney.parts])
             v_required = mdot / (avg_density * avg_area)
 

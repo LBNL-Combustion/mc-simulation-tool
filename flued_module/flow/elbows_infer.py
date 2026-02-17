@@ -47,19 +47,14 @@ def infer_elbows_from_polyline(
     
     elbows = []
     
-    # Convert to numpy array for easier vector operations
     pts = np.array(points)
-    
-    # Process each interior vertex
+
     for i in range(1, len(pts) - 1):
-        # Get the three consecutive points
         p0, p1, p2 = pts[i-1], pts[i], pts[i+1]
-        
-        # Calculate direction vectors
-        v1 = p1 - p0  # Vector from p0 to p1
-        v2 = p2 - p1  # Vector from p1 to p2
-        
-        # Normalize vectors
+
+        v1 = p1 - p0
+        v2 = p2 - p1
+
         len_v1 = np.linalg.norm(v1)
         len_v2 = np.linalg.norm(v2)
         
@@ -70,14 +65,12 @@ def infer_elbows_from_polyline(
         v1_norm = v1 / len_v1
         v2_norm = v2 / len_v2
         
-        # Calculate angle using dot product
         # cos(θ) = v1·v2 / (|v1||v2|)
         cos_angle = np.dot(v1_norm, v2_norm)
-        
+
         # Clamp to avoid numerical issues with arccos
         cos_angle = np.clip(cos_angle, -1.0, 1.0)
-        
-        # Calculate interior angle (0 to π radians)
+
         # Note: cos(0) = 1 (straight), cos(π/2) = 0 (90°), cos(π) = -1 (180°)
         # The bend angle is π - arccos(dot product)
         angle_rad = math.acos(cos_angle)
@@ -88,12 +81,10 @@ def infer_elbows_from_polyline(
         # If vectors are opposite, angle_rad = π, bend = 180°
         bend_angle_deg = math.degrees(angle_rad)
         
-        # Skip if angle is too small
         if bend_angle_deg < min_angle_deg:
             logger.debug(f"Skipping point {i}: angle {bend_angle_deg:.1f}° < {min_angle_deg}°")
             continue
         
-        # Create ElbowSpec for this bend
         elbow = ElbowSpec(
             angle_deg=bend_angle_deg,
             diameter_m=diameter_m,
@@ -121,34 +112,23 @@ def polyline_from_chimney_segments(chimney) -> Optional[List[Tuple[float, float,
         
     Returns:
         List of (x, y, z) points representing the centerline, or None if unable to extract
-        
-    Notes:
-        This is a helper function that adapts the existing chimney.py segment structure
-        to provide centerline points for elbow detection.
     """
     try:
         points = []
         current_x, current_y, current_z = 0.0, 0.0, 0.0
         
-        # Add starting point
         points.append((current_x, current_y, current_z))
         
-        # Process each part
         for part in chimney.parts:
-            # Determine direction based on orientation
             if hasattr(part, 'orientation'):
                 if part.orientation == 'vertical':
-                    # Move upward in z
                     current_z += part.length_m
                 elif part.orientation == 'horizontal':
-                    # Move in x direction (could be made more sophisticated)
                     current_x += part.length_m
                 else:
-                    # Unknown orientation, skip
                     logger.warning(f"Unknown orientation: {part.orientation}")
                     continue
             else:
-                # Default to vertical if no orientation specified
                 current_z += part.length_m
             
             points.append((current_x, current_y, current_z))
@@ -181,7 +161,6 @@ def infer_elbows_from_chimney(
     Returns:
         List of ElbowSpec objects for detected elbows
     """
-    # Extract polyline
     points = polyline_from_chimney_segments(chimney)
     if not points:
         logger.warning("Could not extract polyline from chimney")
@@ -194,9 +173,7 @@ def infer_elbows_from_chimney(
         logger.error("Could not determine chimney diameter")
         return []
     
-    # Determine smoothness if not provided
     if smoothness is None:
-        # Try to infer from chimney material or default
         smoothness = "commercial_steel"
     
     return infer_elbows_from_polyline(

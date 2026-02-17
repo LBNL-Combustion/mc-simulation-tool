@@ -114,11 +114,9 @@ def churchill_f(Re: float, rel_eps: float) -> float:
     if Re < 1:
         return 64.0  # Limit for very low Re
     
-    # Churchill equation components
     A = (2.457 * math.log(1.0 / ((7.0 / Re)**0.9 + 0.27 * rel_eps)))**16
     B = (37530.0 / Re)**16
-    
-    # Combined friction factor
+
     f = 8.0 * ((8.0 / Re)**12 + 1.0 / (A + B)**1.5)**(1.0/12.0)
     
     logger.debug(f"Churchill f: Re={Re:.0f}, ε/D={rel_eps:.6f}, f={f:.6f}")
@@ -153,7 +151,6 @@ def base_K(spec: ElbowSpec) -> float:
     Raises:
         ValueError: If parameters are outside valid ranges
     """
-    # Validate inputs
     if not (0 < spec.angle_deg <= 180):
         raise ValueError(f"Elbow angle must be 0 < angle ≤ 180, got {spec.angle_deg}")
     if spec.diameter_m <= 0:
@@ -257,7 +254,6 @@ def elbow_losses(spec: ElbowSpec, rho: float, mu: float,
         logger.debug(f"Using Le override: Le={Le_m:.2f}m, K={K:.3f}")
         return ElbowLoss(K=K, Le_m=Le_m, method_used="override")
     
-    # Calculate flow properties
     area = math.pi * (spec.diameter_m / 2)**2
     velocity = volumetric_flow_m3_s / area
     Re = rho * velocity * spec.diameter_m / mu
