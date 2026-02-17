@@ -39,6 +39,7 @@ env/
 # Jupyter
 .ipynb_checkpoints/
 *.ipynb_checkpoints
+**/.ipynb_checkpoints/
 
 # Testing
 .pytest_cache/
@@ -49,6 +50,7 @@ htmlcov/
 
 # Generated outputs
 outputs/
+outputs/diagnostic_notebook_pressure_door_events/
 *.png
 
 # Development notebooks/scripts (keep in repo but separate from module)

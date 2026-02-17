@@ -477,6 +477,8 @@ class Chimney:
                  momentum_config: Optional[Dict[str, Any]] = None,
                  room_plenum: Optional[Dict[str, Any]] = None,
                  fittings_thermal: Optional[Dict[str, Any]] = None,
+                 solver_relaxation: Optional[float] = None,
+                 solver_alpha_cap: Optional[float] = None,
                  verbose: bool = False):
         """Initialize chimney simulation.
 
@@ -592,10 +594,15 @@ class Chimney:
 
         self.use_coupled_solver = use_coupled_solver
         if use_coupled_solver:
-            self.coupled_solver = CoupledFlowThermalSolver(
+            solver_kwargs = dict(
                 diagnostics=self.diagnostics_recorder,
                 momentum_config=self._momentum_config,
             )
+            if solver_relaxation is not None:
+                solver_kwargs['relaxation_factor'] = solver_relaxation
+            if solver_alpha_cap is not None:
+                solver_kwargs['alpha_cap'] = solver_alpha_cap
+            self.coupled_solver = CoupledFlowThermalSolver(**solver_kwargs)
             self.convergence_history = []
 
         self.diagnostics = EarlyTimeDiagnostics(ambient_temp_K=self.parts[0].T_ambient_K)
@@ -1342,15 +1349,17 @@ class Chimney:
         """Walk the assembly and compute per-segment elevation and path arrays.
 
         Produces:
-            self.segment_elevations    – shape (total_segments,)  [m above ref]
-            self.segment_path_positions – shape (total_segments,) [m along flow path]
-            self.part_base_elevations  – shape (n_parts,)         [m, bottom of each part]
+            self.segment_elevations     – shape (total_segments,)  [m above ref]
+            self.segment_path_positions – shape (total_segments,)  [m along flow path]
+            self.segment_vertical_heights – shape (total_segments,) [m, vertical rise per segment]
+            self.part_base_elevations   – shape (n_parts,)         [m, bottom of each part]
         """
         n_seg = self.total_segments
         n_parts = len(self.parts)
 
         self.segment_elevations = np.zeros(n_seg)
         self.segment_path_positions = np.zeros(n_seg)
+        self.segment_vertical_heights = np.zeros(n_seg)
         self.part_base_elevations = np.zeros(n_parts)
 
         elev = 0.0   # running elevation accumulator (m)
@@ -1380,8 +1389,10 @@ class Chimney:
                 # segment centre elevation
                 if is_vert:
                     self.segment_elevations[seg_idx] = elev + (ls + 0.5) * seg_len
+                    self.segment_vertical_heights[seg_idx] = seg_len
                 else:
                     self.segment_elevations[seg_idx] = elev  # no vertical rise
+                    self.segment_vertical_heights[seg_idx] = 0.0
 
                 self.segment_path_positions[seg_idx] = path + (ls + 0.5) * seg_len
                 seg_idx += 1
@@ -2397,7 +2408,7 @@ class Chimney:
             part_idx, local_seg, part = self.get_segment_info(seg)
             seg_length = self.segment_lengths[seg]
             heights[seg] = cumulative_height
-            cumulative_height += seg_length
+            cumulative_height += self.segment_vertical_heights[seg]
         heights[n_segs] = cumulative_height
 
         # P(z) ~ P_0 - rho_air * g * z  (small-z approximation)
@@ -2420,7 +2431,7 @@ class Chimney:
             rho_gas = self.density[timestep, seg]
             velocity = self.velocity[timestep, seg]
 
-            dP_hydrostatic = -rho_gas * 9.81 * seg_length
+            dP_hydrostatic = -rho_gas * 9.81 * self.segment_vertical_heights[seg]
 
             dP_friction = 0.0
             if abs(velocity) > 0.01:

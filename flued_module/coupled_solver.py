@@ -43,6 +43,7 @@ class CoupledFlowThermalSolver:
     
     def __init__(self, tolerance: float = 1e-3, max_iterations: int = 5,
                  relaxation_factor: float = 0.3,
+                 alpha_cap: float = 0.5,
                  momentum_config: Optional[MomentumConfig] = None,
                  diagnostics: Optional[DiagnosticsRecorder] = None):
         """
@@ -50,12 +51,14 @@ class CoupledFlowThermalSolver:
             tolerance: Convergence tolerance (relative change)
             max_iterations: Max coupling iterations per timestep
             relaxation_factor: Under-relaxation factor (0-1)
+            alpha_cap: Max fraction of steady-state response per timestep (0-1)
             momentum_config: Momentum physics feature configuration
             diagnostics: Optional DiagnosticsRecorder
         """
         self.tolerance = tolerance
         self.max_iterations = max_iterations
         self.relaxation_factor = relaxation_factor
+        self.alpha_cap = alpha_cap
         self.logger = logging.getLogger(__name__)
 
         self.diagnostics = diagnostics if diagnostics is not None else DiagnosticsRecorder(enable=False)
@@ -208,7 +211,7 @@ class CoupledFlowThermalSolver:
 
         for seg in range(chimney.total_segments):
             part_idx, local_seg, part = chimney.get_segment_info(seg)
-            segment_height = chimney.segment_lengths[seg]
+            segment_height = chimney.segment_vertical_heights[seg]
 
             if part_idx not in ambient_density_cache:
                 ambient_density_cache[part_idx] = chimney.physics.air_density(part.T_ambient_K, part.Pa)
@@ -548,7 +551,7 @@ class CoupledFlowThermalSolver:
             tau = avg_density * system_length / (total_resistance * (abs(mass_flow_steady) + 1e-6))
             tau = max(tau, dt)
 
-            alpha = min(dt / (tau + dt), 0.5)
+            alpha = min(dt / (tau + dt), self.alpha_cap)
             mass_flow_new = mass_flow_old + alpha * (mass_flow_steady - mass_flow_old)
 
         mass_flow_new = mass_flow_new + total_leakage_mdot
@@ -592,7 +595,7 @@ class CoupledFlowThermalSolver:
                     K_elbow = base_K(elbow_spec) * elbow_spec.vane_factor
                     dp_minor += K_elbow * 0.5 * densities[seg] * velocity**2
 
-            dp_segment = buoyancy[seg-1] - dp_friction - dp_minor
+            dp_segment = buoyancy[seg] - dp_friction - dp_minor
             new_pressures[seg] = new_pressures[seg-1] + dp_segment
 
         if self.diagnostics.enable:
