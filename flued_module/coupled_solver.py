@@ -562,7 +562,14 @@ class CoupledFlowThermalSolver:
         mass_flow_new = np.clip(mass_flow_new, -max_mass_flow_magnitude, max_mass_flow_magnitude)
 
         new_pressures = np.zeros_like(pressures)
-        new_pressures[0] = chimney.parts[0].Pa
+        # The gas pressure at the chimney inlet is below atmospheric by the inlet
+        # orifice pressure drop.  Setting new_pressures[0] = Pa (atmospheric) gives
+        # P_gauge > 0 in all segments (exfiltration everywhere), which is wrong.
+        # With the correct boundary the lower segments are at negative P_gauge
+        # (cold-air infiltration) and only upper segments cross into exfiltration,
+        # matching the physical stack underpressure profile.
+        dp_inlet_drop = R_door * (mass_flow_new ** 2) if abs(mass_flow_new) > 1e-10 else 0.0
+        new_pressures[0] = chimney.parts[0].Pa - dp_inlet_drop
         
         for seg in range(1, chimney.total_segments):
             part_idx, local_seg, part = segment_cache[seg]

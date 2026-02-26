@@ -65,6 +65,12 @@ class InletRestrictionConfig:
     # R_stove = K_stove / (2 * rho * A_pipe^2). Set to 0 to disable.
     K_stove: float = 0.0
 
+    # Pipe entrance K-loss (separate from door orifice).
+    # When door is open, A_door >> A_pipe and the orifice R vanishes;
+    # the pipe entrance loss then dominates the inlet resistance.
+    # Typical values: 0.5 (sharp-edged entry), 0.2 (rounded).
+    K_entrance: float = 0.0
+
     # "linear": A_eff = A_eff_raw + A_leak
     # "quadrature": A_eff = sqrt(A_eff_raw^2 + A_leak^2) -- smoother near A_eff_raw=0
     inlet_area_mode: str = "linear"
@@ -78,6 +84,7 @@ class InletRestrictionConfig:
     door_area_m2: float = 0.0  # m²
     A_eff_raw_m2: float = 0.0  # m²
     effective_area_m2: float = 0.0  # m²
+    effective_area_uncapped_m2: float = 0.0  # m² (before pipe-area cap)
     K_equiv: float = 0.0  # = 1/Cd² unless K_loss_override
 
 
@@ -530,6 +537,7 @@ class Chimney:
         self._wind_cfg = self._parse_wind_cap(self.top_boundary)
         self._deltaP_wind_cap_static = None
         self._last_deltaP_wind_cap = 0.0
+        self.K_exit = float(self.top_boundary.get('K_exit', 0.0))
 
         if self._wind_cfg.enable and self._wind_cfg.update_mode == "static":
             V = self._wind_cfg.wind_speed_m_s
@@ -1852,6 +1860,8 @@ class Chimney:
         else:
             A_eff_used = A_eff_raw + A_leak
 
+        self.inlet_restriction.effective_area_uncapped_m2 = A_eff_used
+
         cap_mode = self.inlet_restriction.inlet_area_cap_mode.lower()
         if cap_mode == "pipe":
             A_pipe = self.parts[0].inner_area_m2
@@ -1952,6 +1962,8 @@ class Chimney:
             A_eff_used = math.sqrt(A_eff_raw**2 + A_leak**2)
         else:
             A_eff_used = A_eff_raw + A_leak
+
+        self.inlet_restriction.effective_area_uncapped_m2 = A_eff_used
 
         cap_mode = self.inlet_restriction.inlet_area_cap_mode.lower()
         if cap_mode == "pipe":
@@ -2420,7 +2432,16 @@ class Chimney:
 
         P_inside = np.zeros(n_segs + 1)
         deltaP_wind = getattr(self, '_last_deltaP_wind_cap', 0.0)
-        P_inside[n_segs] = P_ambient[n_segs] + deltaP_wind
+
+        dp_exit = 0.0
+        K_exit = getattr(self, 'K_exit', 0.0)
+        if K_exit > 0 and timestep > 0:
+            last_seg = n_segs - 1
+            rho_exit = self.density[timestep, last_seg]
+            v_exit = self.velocity[timestep, last_seg]
+            dp_exit = K_exit * 0.5 * rho_exit * v_exit**2
+
+        P_inside[n_segs] = P_ambient[n_segs] + deltaP_wind + dp_exit
 
         for seg in range(n_segs - 1, -1, -1):
             part_idx, local_seg, part = self.get_segment_info(seg)

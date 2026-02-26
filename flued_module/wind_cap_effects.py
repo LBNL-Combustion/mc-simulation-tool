@@ -30,7 +30,7 @@ class WindCapConfig:
 # Negative = suction (aids draft), Positive = pressurization (hurts draft)
 BASELINE_CP = {
     "open":     -0.10,   # Mild suction from shear over lip
-    "rain_cap": +0.05,   # Blockage causes weak pressurization
+    "rain_cap": -0.30,   # Wind-induced suction past cap opening
     "shrouded": -0.20,   # Sheltering shroud creates modest suction
     "cone":     -0.30,   # Diffuser/venturi-like geometry
     "venturi":  -0.50,   # Strong suction from venturi effect
