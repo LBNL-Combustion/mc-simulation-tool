@@ -446,9 +446,11 @@ class CoupledFlowThermalSolver:
                     K_elbow = base_K(elbow_spec) * elbow_spec.vane_factor
                     K_minor += K_elbow
 
-            # R_seg = (f*L/D + K_minor) * rho / (2 * A^2)
             K_total = f * length / diameter + K_minor
-            R_seg = K_total * densities[seg] / (2 * area**2)
+            # Mass-flow quadratic resistance: dp = R * mdot^2
+            # From dp = (fL/D + K) * 0.5 * rho * v^2  with v = mdot/(rho*A):
+            #   dp = (fL/D + K) * mdot^2 / (2 * rho * A^2)
+            R_seg = K_total / (2 * densities[seg] * area**2)
             total_resistance += R_seg
 
         # --- 2. Inlet restriction resistance ---
@@ -460,6 +462,17 @@ class CoupledFlowThermalSolver:
             dp_catalytic = self._calculate_catalytic_bypass_loss(chimney, mass_flow_old, densities)
             R_bypass = dp_catalytic / (mass_flow_old**2) if dp_catalytic > 0 else 0.0
             total_resistance += R_bypass
+
+        # --- 3b. Exit velocity head loss ---
+        K_exit = getattr(chimney, 'K_exit', 0.0)
+        R_exit = 0.0
+        if K_exit > 0:
+            last_seg = chimney.total_segments - 1
+            part_idx_exit, _, part_exit = segment_cache[last_seg]
+            rho_exit = densities[last_seg]
+            A_exit = part_exit.inner_area_m2
+            R_exit = K_exit / (2.0 * rho_exit * A_exit**2)
+            total_resistance += R_exit
 
         # --- 4. Distributed Leakage (VENT-II style) ---
         total_leakage_mdot = 0.0
@@ -634,6 +647,8 @@ class CoupledFlowThermalSolver:
             if abs(mass_flow_new) > 1e-10:
                 dp_bypass_diag = self._calculate_catalytic_bypass_loss(chimney, mass_flow_new, densities)
 
+            dp_exit_diag = R_exit * mass_flow_new**2 if R_exit > 0 and abs(mass_flow_new) > 1e-10 else 0.0
+
             self.diagnostics.record_momentum_budget(
                 step=chimney.time_step,
                 time_s=chimney.current_time,
@@ -648,6 +663,7 @@ class CoupledFlowThermalSolver:
                 dp_inlet=dp_inlet_diag,
                 dp_stove=dp_stove_diag,
                 dp_bypass=dp_bypass_diag,
+                dp_exit=dp_exit_diag,
                 dp_accel=dp_accel_total,
                 dp_leakage=0.0,  # leakage modifies mdot, not dp directly
             )

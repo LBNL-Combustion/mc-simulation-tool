@@ -90,9 +90,9 @@ class DiagnosticsRecorder:
         dp_inlet: float,
         dp_stove: float,
         dp_bypass: float,
-        dp_exit: float,
-        dp_accel: float,
-        dp_leakage: float,
+        dp_exit: float = 0.0,
+        dp_accel: float = 0.0,
+        dp_leakage: float = 0.0,
     ):
         """Record momentum-side quantities for one timestep."""
         if not self.enable:
