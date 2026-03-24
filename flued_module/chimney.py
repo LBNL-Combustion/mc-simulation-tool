@@ -478,7 +478,7 @@ class Chimney:
                  inlet_temp_csv: Optional[str] = None,
                  inlet_temp_func: Optional[callable] = None,
                  door_temp_dilution: Optional[Dict[str, Any]] = None,
-                 room_pressure_offset_Pa: float = 0.0,
+                 room_pressure_offset_Pa = 0.0,  # float or callable(t_s) -> Pa
                  leakage_config: Optional[Dict[str, Any]] = None,
                  enable_diagnostics: bool = False,
                  momentum_config: Optional[Dict[str, Any]] = None,
@@ -633,7 +633,12 @@ class Chimney:
             self.coupled_solver.momentum_config.use_distributed_leakage = True
 
         self.verbose = verbose
-        self.room_pressure_offset_Pa = room_pressure_offset_Pa
+        if callable(room_pressure_offset_Pa):
+            self._room_pressure_func = room_pressure_offset_Pa
+            self.room_pressure_offset_Pa = 0.0
+        else:
+            self._room_pressure_func = None
+            self.room_pressure_offset_Pa = room_pressure_offset_Pa
 
         self.segment_lengths = np.zeros(self.total_segments)
         seg_idx = 0
@@ -695,6 +700,8 @@ class Chimney:
                 Pa_ambient = self.parts[0].Pa
                 dp_room = self.room_plenum.update(mdot_prev, Pa_ambient, self.dt)
                 self.room_pressure_offset_Pa = dp_room
+            elif self._room_pressure_func is not None:
+                self.room_pressure_offset_Pa = self._room_pressure_func(self.current_time)
 
             # === INLET TEMPERATURE ===
             T_ambient_inlet = self.parts[0].T_ambient_K
@@ -2423,12 +2430,13 @@ class Chimney:
             cumulative_height += self.segment_vertical_heights[seg]
         heights[n_segs] = cumulative_height
 
-        # P(z) ~ P_0 - rho_air * g * z  (small-z approximation)
-        P_ambient_base = self.parts[0].Pa
-        T_ambient_avg = np.mean([p.T_ambient_K for p in self.parts])
-        rho_ambient_avg = self.physics.air_density(T_ambient_avg, P_ambient_base)
-
-        P_ambient = P_ambient_base - rho_ambient_avg * 9.81 * heights
+        # Ambient pressure column: per-segment density from each part's T_ambient
+        P_ambient = np.zeros(n_segs + 1)
+        P_ambient[0] = self.parts[0].Pa
+        for seg in range(n_segs):
+            part_idx, local_seg, part = self.get_segment_info(seg)
+            rho_ambient = self.physics.air_density(part.T_ambient_K, part.Pa)
+            P_ambient[seg + 1] = P_ambient[seg] - rho_ambient * 9.81 * self.segment_vertical_heights[seg]
 
         P_inside = np.zeros(n_segs + 1)
         deltaP_wind = getattr(self, '_last_deltaP_wind_cap', 0.0)

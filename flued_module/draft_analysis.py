@@ -43,7 +43,8 @@ class DraftAnalyzer:
         draft_velocity = np.zeros(n_steps)
         pressure_losses = np.zeros(n_steps)
         
-        stack_height = sum(part.height_m for part in self.chimney.parts)
+        stack_height = sum(part.height_m for part in self.chimney.parts
+                          if part.orientation == 'vertical')
 
         for step in range(n_steps):
             cumulative_draft = 0
@@ -51,27 +52,28 @@ class DraftAnalyzer:
             
             for seg in range(n_segments):
                 part_idx, local_seg, part = self.chimney.get_segment_info(seg)
-                segment_height = part.height_m / part.num_segments
-                
+                vertical_height = self.chimney.segment_vertical_heights[seg]
+                seg_length = self.chimney.segment_lengths[seg]
+
                 T_gas = self.chimney.T_gas[step, seg]
                 T_ambient = part.T_ambient_K
                 P_ambient = part.Pa
-                
+
                 rho_gas = self.chimney.density[step, seg]
                 rho_ambient = self.chimney.physics.air_density(T_ambient, P_ambient)
-                
-                dp_buoyancy = self.g * segment_height * (rho_ambient - rho_gas)
+
+                dp_buoyancy = self.g * vertical_height * (rho_ambient - rho_gas)
                 segment_draft[step, seg] = dp_buoyancy
                 cumulative_draft += dp_buoyancy
-                
+
                 if step > 0:
                     velocity = self.chimney.velocity[step, seg]
                     diameter = part.inner_diameter_m
-                    
+
                     if abs(velocity) > 0.01:
                         Re = rho_gas * abs(velocity) * diameter / self.chimney.physics.air_viscosity(T_gas)
                         f = self._friction_factor(Re, part.roughness_m / diameter)
-                        dp_friction = f * (segment_height / diameter) * 0.5 * rho_gas * velocity**2
+                        dp_friction = f * (seg_length / diameter) * 0.5 * rho_gas * velocity**2
                         
                         # Add fitting losses from actual elbow specs
                         elbow_key = (part_idx, local_seg)
