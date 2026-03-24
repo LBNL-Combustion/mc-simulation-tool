@@ -95,14 +95,14 @@ def _friction_factor_colebrook(Re: float, rel_rough: float) -> float:
 
 
 # =============================================================================
-# DISTRIBUTED LEAKAGE CALCULATIONS (Part A - VENT-II Style)
+# DISTRIBUTED LEAKAGE CALCULATIONS (Part A)
 # =============================================================================
 
 def calculate_leakage_mass_flow(P_gauge: float, A_leak_m2: float, Cd_leak: float,
                                  rho_ambient: float, rho_gas: float) -> float:
     """Calculate leakage mass flow at a segment joint/location
 
-    VENT-II style leakage model:
+    Leakage model:
     - If P_gauge > 0: gas pressure above ambient → leaking OUT (uses rho_ambient)
     - If P_gauge < 0: gas pressure below ambient → leaking IN (uses rho_gas)
 

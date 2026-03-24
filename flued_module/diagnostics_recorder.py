@@ -33,6 +33,7 @@ class TimestepBudget:
     dp_inlet_Pa: float = 0.0
     dp_stove_Pa: float = 0.0
     dp_bypass_Pa: float = 0.0
+    dp_exit_Pa: float = 0.0
     dp_accel_Pa: float = 0.0
     dp_leakage_Pa: float = 0.0
     dp_losses_total_Pa: float = 0.0
@@ -89,8 +90,9 @@ class DiagnosticsRecorder:
         dp_inlet: float,
         dp_stove: float,
         dp_bypass: float,
-        dp_accel: float,
-        dp_leakage: float,
+        dp_exit: float = 0.0,
+        dp_accel: float = 0.0,
+        dp_leakage: float = 0.0,
     ):
         """Record momentum-side quantities for one timestep."""
         if not self.enable:
@@ -111,11 +113,12 @@ class DiagnosticsRecorder:
         rec.dp_inlet_Pa = dp_inlet
         rec.dp_stove_Pa = dp_stove
         rec.dp_bypass_Pa = dp_bypass
+        rec.dp_exit_Pa = dp_exit
         rec.dp_accel_Pa = dp_accel
         rec.dp_leakage_Pa = dp_leakage
         rec.dp_losses_total_Pa = (
             dp_friction + dp_fittings + dp_inlet + dp_stove
-            + dp_bypass + dp_accel + dp_leakage
+            + dp_bypass + dp_exit + dp_accel + dp_leakage
         )
         rec.dp_residual_Pa = rec.dp_available_Pa - rec.dp_losses_total_Pa
 

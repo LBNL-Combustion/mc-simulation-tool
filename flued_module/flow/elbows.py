@@ -60,10 +60,11 @@ BASE_LOSS_DATA: Dict[tuple, Dict[str, List[float]]] = {
     ("rough", "mitered", 90): {"R_over_D": [1.0], "K": [2.60]},
 
     # Tee junctions - branch flow (90° turn into branch)
-    # Through-flow would be K≈0.2-0.4, but we model branch flow (higher loss)
-    ("smooth", "tee", 90): {"R_over_D": [1.0], "K": [0.90]},
-    ("commercial_steel", "tee", 90): {"R_over_D": [1.0], "K": [1.00]},
-    ("rough", "tee", 90): {"R_over_D": [1.0], "K": [1.10]},
+    # K=0.5-0.8 typical for cast residential chimney tees (ASHRAE);
+    # sharp-edged branch K≈1.0 is too high for smooth-radius fittings.
+    ("smooth", "tee", 90): {"R_over_D": [1.0], "K": [0.50]},
+    ("commercial_steel", "tee", 90): {"R_over_D": [1.0], "K": [0.60]},
+    ("rough", "tee", 90): {"R_over_D": [1.0], "K": [0.70]},
 }
 
 # Surface roughness values (m) from engineering handbooks
@@ -141,16 +142,20 @@ def _interpolate(x: float, x_vals: List[float], y_vals: List[float]) -> float:
 def base_K(spec: ElbowSpec) -> float:
     """
     Determine base loss coefficient K from tables and scaling rules.
-    
+
     Args:
         spec: Elbow specification
-        
+
     Returns:
         Base K value for the elbow
-        
+
     Raises:
         ValueError: If parameters are outside valid ranges
     """
+    # Respect K_override if set (used by sweep notebooks to test different K values)
+    if spec.K_override is not None:
+        return max(0.0, spec.K_override)
+
     if not (0 < spec.angle_deg <= 180):
         raise ValueError(f"Elbow angle must be 0 < angle ≤ 180, got {spec.angle_deg}")
     if spec.diameter_m <= 0:
