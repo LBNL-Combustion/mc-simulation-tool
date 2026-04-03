@@ -113,12 +113,19 @@ class ComprehensiveHeatTransfer:
             factor = (reynolds - 2300) / (4000 - 2300)
             return Nu_lam + factor * (Nu_turb - Nu_lam)
 
-        else:  # Turbulent — Dittus-Boelter (heating)
+        else:  # Turbulent — Dittus-Boelter (heating) + Gnielinski entry correction
             if reynolds <= 0 or prandtl <= 0:
                 return 3.66
             if reynolds > 1e6:
                 reynolds = 1e6
-            return 0.023 * reynolds**0.8 * prandtl**0.4
+            Nu_fd = 0.023 * reynolds**0.8 * prandtl**0.4
+            # Entry-region correction (Gnielinski 1976):
+            # Nu = Nu_fd * [1 + (D/L)^(2/3)]
+            # Significant for L/D < ~20, negligible for L/D > 60
+            if length_diameter_ratio and length_diameter_ratio < 60:
+                entry_factor = 1.0 + (1.0 / length_diameter_ratio) ** (2.0 / 3.0)
+                Nu_fd *= entry_factor
+            return Nu_fd
     
     def nusselt_natural_convection_external(self, rayleigh: float, orientation: str,
                                           height_diameter_ratio: float = 1.0) -> float:
@@ -474,6 +481,7 @@ class ComprehensiveHeatTransfer:
         thermal_length = segment_data.get('thermal_length', length)  # may include absorbed fitting area
         extra_wall_Cj = segment_data.get('extra_wall_Cj', 0.0)
         orientation = segment_data.get('orientation', 'vertical')
+        part_height = segment_data.get('part_height', length)  # full part height for external convection
         has_fittings = segment_data.get('has_fittings', False)
         wall_props = segment_data['wall_properties']
         wall_type = segment_data.get('wall_type', 'single')
@@ -489,7 +497,9 @@ class ComprehensiveHeatTransfer:
         Re = self.reynolds_number(velocity, diameter, gas_props)
         Pr = self.prandtl_number(gas_props)
 
-        Nu_forced = self.nusselt_forced_convection_internal(Re, Pr, length/diameter)
+        # Use cumulative distance from part entrance for entry-region correction
+        x_from_start = segment_data.get('x_from_part_start', length)
+        Nu_forced = self.nusselt_forced_convection_internal(Re, Pr, x_from_start/diameter)
         h_forced = Nu_forced * gas_props.thermal_conductivity / diameter
 
         # Fittings turbulence enhancement (~20%)
@@ -576,12 +586,20 @@ class ComprehensiveHeatTransfer:
             
             if wall_type == 'single':
                 outer_diameter = diameter + 2 * wall_props['thickness']
-                ambient_props = self.gas_properties(T_ambient, pressure)
+                T_film_outer = (T_wall_current + T_ambient) / 2.0
+                film_props_outer = self.gas_properties(T_film_outer, pressure)
 
-                Gr_outer = self.grashof_number(outer_diameter, T_wall_current, T_ambient, ambient_props)
-                Ra_outer = self.rayleigh_number(Gr_outer, self.prandtl_number(ambient_props))
+                # Vertical: height-based Gr (standard for vertical surfaces)
+                # Horizontal: diameter-based Gr (standard for horizontal cylinders)
+                if orientation.lower() == 'vertical':
+                    L_ext = part_height
+                else:
+                    L_ext = outer_diameter
+
+                Gr_outer = self.grashof_number(L_ext, T_wall_current, T_ambient, film_props_outer)
+                Ra_outer = self.rayleigh_number(Gr_outer, self.prandtl_number(film_props_outer))
                 Nu_outer = self.nusselt_natural_convection_external(Ra_outer, orientation)
-                h_conv_outer = Nu_outer * ambient_props.thermal_conductivity / outer_diameter
+                h_conv_outer = Nu_outer * film_props_outer.thermal_conductivity / L_ext
 
                 emissivity = wall_props.get('emissivity', 0.8)
                 h_rad_outer = self.radiation_heat_transfer_coefficient(T_wall_current, T_ambient, emissivity)
@@ -600,22 +618,29 @@ class ComprehensiveHeatTransfer:
                     T_wall_current, T_gas, T_ambient, wall_props, geometry,
                     h_inner_effective, h_outer, dt
                 )
-                
+
                 T_wall_current = T_wall_new
-                
+
             else:  # triple wall
                 outer_diameter = (diameter + 2 * (wall_props['liner']['thickness'] +
                                 wall_props.get('air_gap_inner', 0) +
-                                wall_props['middle']['thickness'] + 
+                                wall_props['middle']['thickness'] +
                                 wall_props.get('air_gap_outer', 0) +
                                 wall_props['outer']['thickness']))
-                
-                ambient_props = self.gas_properties(T_ambient, pressure)
-                Gr_outer = self.grashof_number(outer_diameter, T_outer_current, T_ambient, ambient_props)
-                Ra_outer = self.rayleigh_number(Gr_outer, self.prandtl_number(ambient_props))
+
+                T_film_outer = (T_outer_current + T_ambient) / 2.0
+                film_props_outer = self.gas_properties(T_film_outer, pressure)
+
+                if orientation.lower() == 'vertical':
+                    L_ext = part_height
+                else:
+                    L_ext = outer_diameter
+
+                Gr_outer = self.grashof_number(L_ext, T_outer_current, T_ambient, film_props_outer)
+                Ra_outer = self.rayleigh_number(Gr_outer, self.prandtl_number(film_props_outer))
                 Nu_outer = self.nusselt_natural_convection_external(Ra_outer, orientation)
-                h_conv_outer = Nu_outer * ambient_props.thermal_conductivity / outer_diameter
-                
+                h_conv_outer = Nu_outer * film_props_outer.thermal_conductivity / L_ext
+
                 emissivity_outer = wall_props['outer'].get('emissivity', 0.8)
                 h_rad_outer = self.radiation_heat_transfer_coefficient(T_outer_current, T_ambient, emissivity_outer)
                 h_outer = h_conv_outer + h_rad_outer
