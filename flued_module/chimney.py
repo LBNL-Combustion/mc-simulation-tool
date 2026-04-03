@@ -824,6 +824,9 @@ class Chimney:
             else:
                 velocity = self.velocity[step-1, seg]
                 
+            # Cumulative distance from start of this part (for entry-region correction)
+            x_from_part_start = (local_seg + 0.5) * segment_length
+
             segment_data = {
                 'gas_temperature': self.T_gas[step, seg],
                 'ambient_temperature': part.T_ambient_K,
@@ -831,7 +834,9 @@ class Chimney:
                 'velocity': velocity,
                 'diameter': part.inner_diameter_m,
                 'length': segment_length,
+                'x_from_part_start': x_from_part_start,
                 'orientation': part.orientation,
+                'part_height': part.height_m,
                 'has_fittings': part.has_fittings,
                 'humidity_ratio': part.humidity_ratio,
                 'wall_type': part.type,
@@ -2451,6 +2456,10 @@ class Chimney:
 
         P_inside[n_segs] = P_ambient[n_segs] + deltaP_wind + dp_exit
 
+        total_dp_buoyancy = 0.0
+        total_dp_friction = 0.0
+        total_dp_fittings = 0.0
+
         for seg in range(n_segs - 1, -1, -1):
             part_idx, local_seg, part = self.get_segment_info(seg)
             seg_length = self.segment_lengths[seg]
@@ -2485,8 +2494,54 @@ class Chimney:
                     K_fitting = base_K(elbow_spec) * elbow_spec.vane_factor
                     dP_fitting += K_fitting * 0.5 * rho_gas * velocity**2
 
+            # Accumulate totals for diagnostics
+            # Buoyancy = ambient hydrostatic - gas hydrostatic (positive = upward draft)
+            rho_amb_seg = self.physics.air_density(part.T_ambient_K, part.Pa)
+            total_dp_buoyancy += (rho_amb_seg - rho_gas) * 9.81 * self.segment_vertical_heights[seg]
+            total_dp_friction += dP_friction
+            total_dp_fittings += dP_fitting
+
             # P_bottom = P_top - dP_hydrostatic + dP_friction + dP_fitting
             P_inside[seg] = P_inside[seg + 1] - dP_hydrostatic + dP_friction + dP_fitting
+
+        # --- Inlet restriction (diagnostic only, NOT subtracted) ---
+        # The momentum solver already accounts for dp_door/dp_stove in mass flow.
+        # The top-down integration reflects this through reduced velocities/friction.
+        # Subtracting dp_door uniformly was double-counting (confirmed by 0130 test:
+        # TC3 and TOP match experiment perfectly WITHOUT dp_door subtraction).
+        _dp_door = 0.0
+        _dp_stove = 0.0
+        _A_eff = 0.0
+        _mdot = 0.0
+        if self.inlet_restriction.enable and timestep > 0:
+            _A_eff = self.A_eff_history[timestep] if hasattr(self, 'A_eff_history') \
+                else self.inlet_restriction.effective_area_m2
+            if _A_eff > 0:
+                Cd = self.inlet_restriction.Cd
+                K_door = 1.0 / (Cd ** 2) if Cd > 0 else 0.0
+                rho_0 = self.density[timestep, 0]
+                _mdot = self.mass_flow_rate[timestep] if self.mass_flow_rate.ndim == 1 \
+                    else self.mass_flow_rate[timestep, 0]
+                _dp_door = K_door / (2.0 * rho_0 * _A_eff ** 2) * _mdot ** 2
+                K_stove = getattr(self.inlet_restriction, 'K_stove', 0.0)
+                if K_stove > 0:
+                    A_pipe = self.parts[0].inner_area_m2
+                    _dp_stove = K_stove / (2.0 * rho_0 * A_pipe ** 2) * _mdot ** 2
+                # NOT subtracted: already in the integration via momentum solver
+
+        # --- Room depressurization ---
+        # dp_room IS needed: the top boundary is at P_ambient(outdoor),
+        # but the room (chimney inlet) is at P_ambient - dp_room.
+        # The integration doesn't know this — it only uses gas properties.
+        _dp_room = 0.0
+        if True:
+            t_s = timestep * self.dt
+            if self._room_pressure_func is not None:
+                _dp_room = self._room_pressure_func(t_s)
+            elif self.room_plenum.cfg.enable:
+                _dp_room = self.room_pressure_offset_Pa
+            if _dp_room != 0.0:
+                P_inside[:] -= _dp_room
 
         P_gauge = P_inside - P_ambient
 
@@ -2494,7 +2549,18 @@ class Chimney:
             'height_m': heights,
             'P_gauge_Pa': P_gauge,
             'P_absolute_Pa': P_inside,
-            'P_ambient_Pa': P_ambient
+            'P_ambient_Pa': P_ambient,
+            # Pressure component breakdown (all positive = reduces gauge pressure)
+            'dp_buoyancy': total_dp_buoyancy,
+            'dp_friction': total_dp_friction,
+            'dp_fittings': total_dp_fittings,
+            'dp_door': _dp_door,
+            'dp_stove': _dp_stove,
+            'dp_room': _dp_room,
+            'dp_wind': deltaP_wind,
+            'dp_exit': dp_exit,
+            'A_eff_m2': _A_eff,
+            'mdot': _mdot,
         }
 
 

@@ -696,6 +696,8 @@ class CoupledFlowThermalSolver:
                     prev_T_middle = part.T_ambient_K
                     prev_T_outer = part.T_ambient_K
             
+            x_from_part_start = (local_seg + 0.5) * segment_length
+
             segment_data = {
                 'gas_temperature': temperatures[seg],
                 'ambient_temperature': part.T_ambient_K,
@@ -703,7 +705,9 @@ class CoupledFlowThermalSolver:
                 'velocity': velocities[seg],
                 'diameter': part.inner_diameter_m,
                 'length': segment_length,
+                'x_from_part_start': x_from_part_start,
                 'orientation': part.orientation,
+                'part_height': part.height_m,
                 'has_fittings': part.has_fittings,
                 'humidity_ratio': part.humidity_ratio,
                 'wall_type': part.type,
