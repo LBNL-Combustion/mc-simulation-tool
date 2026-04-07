@@ -185,14 +185,132 @@ class CoupledFlowThermalSolver:
         
         _PC['picard_iterations'] += metrics.iterations  # TEMP: profiling
 
+        # ----------------------------------------------------------------
+        # Reverse-flow ignition correction
+        # ----------------------------------------------------------------
+        # In 1D upwind advection, reverse flow (mdot<0) prevents hot inlet
+        # gas from propagating upward.  The solver can lock into reverse
+        # flow even when the fire's driving potential clearly exceeds the
+        # opposing room depressurization.  This correction detects that
+        # condition and re-solves with a positive initial guess so that
+        # the forward-flow solution can be found.
+        #
+        # The driving potential is computed over the first chimney part
+        # (stove-adjacent section) only, using T_inlet as the hypothetical
+        # gas temperature.  This represents the available draft if the
+        # fire's heat could establish in that section — which the 1D
+        # reverse-flow advection cannot otherwise capture.
+        # ----------------------------------------------------------------
+        MARGIN_FORWARD_PA = 1.0
+
+        if current_state['mass_flow'] < 0:
+            T_amb_part0 = chimney.parts[0].T_ambient_K
+            if T_inlet > T_amb_part0 + 20:
+                dp_drive_pot = self._compute_fire_driving_potential_first_part(
+                    chimney, T_inlet)
+                dp_room = getattr(chimney, 'room_pressure_offset_Pa', 0.0)
+
+                if dp_drive_pot > dp_room + MARGIN_FORWARD_PA:
+                    # Seed first-part gas temperatures conservatively
+                    n_part0 = chimney.parts[0].num_segments
+                    for seg in range(n_part0):
+                        T_local_amb = chimney.parts[0].T_ambient_K
+                        T_seed = 0.8 * T_inlet + 0.2 * T_local_amb
+                        current_state['temperatures'][seg] = max(
+                            current_state['temperatures'][seg], T_seed)
+
+                    # Positive mass-flow initial guess from driving potential
+                    densities_new = self._update_densities(
+                        chimney, current_state['temperatures'])
+                    buoyancy_new = self._calculate_buoyancy(chimney, densities_new)
+
+                    rho_inlet_new = densities_new[0]
+                    R_door = self._calculate_inlet_restriction_resistance(
+                        chimney, rho_inlet_new)
+                    R_total_approx = R_door + 1e-3  # small floor
+                    for seg in range(chimney.total_segments):
+                        pidx, lseg, part = chimney.get_segment_info(seg)
+                        R_total_approx += 0.02 * (chimney.segment_lengths[seg]
+                            / part.inner_diameter_m) / (
+                            2.0 * densities_new[seg] * part.inner_area_m2**2)
+
+                    dp_net = max(dp_drive_pot - dp_room, 0.1)
+                    mdot_guess = np.sqrt(dp_net / R_total_approx)
+                    current_state['mass_flow'] = mdot_guess
+
+                    # Re-run Picard with positive initial guess
+                    for re_iter in range(self.max_iterations):
+                        densities_new = self._update_densities(
+                            chimney, current_state['temperatures'])
+                        buoyancy_new = self._calculate_buoyancy(
+                            chimney, densities_new)
+                        new_mf, new_pr = self._solve_momentum_improved(
+                            chimney, current_state['pressures'],
+                            densities_new, buoyancy_new,
+                            current_state['mass_flow'], dt)
+                        vels = self._calculate_velocities(
+                            chimney, new_mf, densities_new)
+                        new_temps = self._solve_energy_improved(
+                            chimney, step, current_state['temperatures'],
+                            vels, new_mf, dt)
+
+                        current_state['temperatures'] = (
+                            current_relaxation * new_temps
+                            + (1 - current_relaxation)
+                            * current_state['temperatures'])
+                        current_state['mass_flow'] = (
+                            current_relaxation * new_mf
+                            + (1 - current_relaxation)
+                            * current_state['mass_flow'])
+                        current_state['pressures'] = (
+                            current_relaxation * new_pr
+                            + (1 - current_relaxation)
+                            * current_state['pressures'])
+
+                        if abs(new_mf - current_state['mass_flow']) / (
+                                abs(new_mf) + 1e-10) < self.tolerance:
+                            break
+
+                    densities = self._update_densities(
+                        chimney, current_state['temperatures'])
+                    velocities = self._calculate_velocities(
+                        chimney, current_state['mass_flow'], densities)
+
         chimney.T_gas[step] = current_state['temperatures']
         chimney.mass_flow_rate[step] = current_state['mass_flow']
         chimney.pressure[step] = current_state['pressures']
         chimney.density[step] = densities
         chimney.velocity[step] = velocities
-        
+
         return metrics
     
+    def _compute_fire_driving_potential_first_part(self, chimney, T_inlet: float) -> float:
+        """Driving potential if the first chimney part were filled with gas at T_inlet.
+
+        This is NOT the actual buoyancy in the column — it is the driving
+        pressure that the fire COULD produce in the stove-adjacent section
+        if its heat propagated freely.  Used only during reverse-flow
+        conditions to decide whether the fire is strong enough to
+        overcome room depressurization and establish forward draft.
+
+        Only the first part (typically the single-wall black pipe directly
+        above the stove) is considered.  The rest of the chimney is
+        assumed to remain at ambient temperature, contributing zero net
+        buoyancy.
+
+        Returns:
+            Driving potential in Pa (positive = upward draft).
+        """
+        g = chimney.physics.GRAVITY
+        part0 = chimney.parts[0]
+        n_seg0 = part0.num_segments
+        dp = 0.0
+        for seg in range(n_seg0):
+            rho_amb = chimney.physics.air_density(part0.T_ambient_K, part0.Pa)
+            rho_hot = chimney.physics.air_density(T_inlet, part0.Pa)
+            dp += (rho_amb - rho_hot) * g * chimney.segment_vertical_heights[seg]
+        return dp
+
     def _update_densities(self, chimney, temperatures: np.ndarray) -> np.ndarray:
         """Update gas densities from ideal gas law."""
         densities = np.zeros_like(temperatures)
@@ -767,6 +885,9 @@ class CoupledFlowThermalSolver:
                     T_upstream = part.T_ambient_K
                 else:
                     T_upstream = temperatures[seg+1]
+                # Note: reverse-flow ignition correction is handled at the
+                # timestep level (after Picard convergence), not here in the
+                # energy solver advection scheme.
             
             ht_results = chimney.comprehensive_ht.calculate_segment_heat_transfer(segment_data, dt)
 
