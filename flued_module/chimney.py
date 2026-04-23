@@ -2563,6 +2563,124 @@ class Chimney:
             'mdot': _mdot,
         }
 
+    def get_frontend_outputs(self, parts_to_plot):
+        """Build JSON-serializable payload of risk classifications, SS extremes, and plot data.
+
+        Call after run_simulation(). Reads instance attributes (T_gas, time_array, parts, ...).
+
+        Args:
+            parts_to_plot: 1-based part indices for the temperature plot (e.g. [1, 3, 4]).
+                Max 5 entries, no duplicates, each in [1, len(self.parts)].
+
+        Returns:
+            dict with keys:
+                ul103_risk                 "low" | "medium" | "high"  (high = fails UL 103)
+                backdraft_risk             "low" | "medium" | "high"  (high = never established)
+                max_static_pressure_ss_Pa  float
+                max_temperature_ss_C       float
+                static_pressure_plot       {time_min, static_pressure_Pa}
+                temperature_plot           {time_min, series: [{label, temperature_C}, ...]}
+        """
+        n_parts = len(self.parts)
+        if not isinstance(parts_to_plot, (list, tuple)) or len(parts_to_plot) == 0:
+            raise ValueError("parts_to_plot must be a non-empty list of 1-based part indices")
+        if len(parts_to_plot) > 5:
+            raise ValueError(f"parts_to_plot has {len(parts_to_plot)} entries; maximum is 5")
+        if len(set(parts_to_plot)) != len(parts_to_plot):
+            raise ValueError("parts_to_plot contains duplicates")
+        for p in parts_to_plot:
+            if not isinstance(p, int) or p < 1 or p > n_parts:
+                raise ValueError(f"parts_to_plot entry {p!r} out of range [1, {n_parts}]")
+
+        n_steps = self.T_gas.shape[0]
+        time_s = self.time_array
+        time_min = time_s / 60.0
+
+        # Static pressure at segment 0. Sign flipped so positive = normal upward draft.
+        static_pressure_Pa = np.zeros(n_steps)
+        for step in range(n_steps):
+            prof = self.get_static_pressure_profile(timestep=step)
+            static_pressure_Pa[step] = -prof['P_gauge_Pa'][0]
+
+        T_first = self.T_gas[:, 0]
+        T_last = self.T_gas[:, -1]
+        T_signal = 0.5 * (T_first + T_last)
+
+        # Peak-based steady-state window defined by temperature alone.
+        # Pressure often spikes during startup transients before the chimney
+        # establishes real draft, so locking the SS window to T (the chimney
+        # is "operating" when T is near its peak) is more robust than
+        # requiring both signals to peak simultaneously.
+        SS_FRAC = 0.90
+        T_peak = T_signal.max()
+        in_ss = T_signal >= SS_FRAC * T_peak
+        if in_ss.any():
+            ss_idx = np.where(in_ss)[0]
+        else:
+            ss_idx = np.arange(int(0.8 * n_steps), n_steps)
+
+        max_static_pressure_ss_Pa = float(static_pressure_Pa[ss_idx].max())
+        max_temperature_ss_C = float(np.maximum(T_first[ss_idx], T_last[ss_idx]).max() - 273.15)
+        draft_at_ss = float(static_pressure_Pa[ss_idx].mean())
+
+        # UL 103 draft requirement: 0.006 in.w.c. per ft of vertical chimney (Section 25.1).
+        h_vert_m = sum(p.height_m for p in self.parts if p.orientation.lower() == 'vertical')
+        ul_required_Pa = 0.006 * (h_vert_m * 3.28084) * 249.089
+        if ul_required_Pa > 0:
+            ratio = max_static_pressure_ss_Pa / ul_required_Pa
+            if ratio < 1.0:
+                ul103_risk = "high"
+            elif ratio < 1.5:
+                ul103_risk = "medium"
+            else:
+                ul103_risk = "low"
+        else:
+            ul103_risk = "high"
+
+        # Backdraft risk: high = never established, medium = early dip then recovered, low = clean.
+        THRESH_ESTABLISHED_PA = 2.0
+        THRESH_BACKDRAFT_PA = 0.5
+        EARLY_WINDOW_S = 180.0
+        BACKDRAFT_DURATION_S = 30.0
+
+        if draft_at_ss < THRESH_ESTABLISHED_PA:
+            backdraft_risk = "high"
+        else:
+            early_mask = time_s < EARLY_WINDOW_S
+            backdraft_duration_s = float((static_pressure_Pa[early_mask] < -THRESH_BACKDRAFT_PA).sum()) * self.dt
+            backdraft_risk = "medium" if backdraft_duration_s > BACKDRAFT_DURATION_S else "low"
+
+        # Mid-segment temperature series per selected part.
+        part_ranges = []
+        s0 = 0
+        for part in self.parts:
+            part_ranges.append((s0, s0 + part.num_segments))
+            s0 += part.num_segments
+
+        series = []
+        for part_num in parts_to_plot:
+            seg_lo, seg_hi = part_ranges[part_num - 1]
+            mid_seg = seg_lo + (seg_hi - seg_lo) // 2
+            series.append({
+                "label": f"Part {part_num}",
+                "temperature_C": (self.T_gas[:, mid_seg] - 273.15).tolist(),
+            })
+
+        return {
+            "ul103_risk": ul103_risk,
+            "backdraft_risk": backdraft_risk,
+            "max_static_pressure_ss_Pa": max_static_pressure_ss_Pa,
+            "max_temperature_ss_C": max_temperature_ss_C,
+            "static_pressure_plot": {
+                "time_min": time_min.tolist(),
+                "static_pressure_Pa": static_pressure_Pa.tolist(),
+            },
+            "temperature_plot": {
+                "time_min": time_min.tolist(),
+                "series": series,
+            },
+        }
+
 
 # Bind optional plotting methods (gitignored, dev only)
 try:
