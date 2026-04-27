@@ -29,7 +29,9 @@ class InletRestrictionConfig:
         door_width_ft: Door width [ft]
         door_height_ft: Door height [ft]
         door_cracked_percent: Enables dynamic door schedule if set
-        door_wide_open_time_s: Duration wide open [s]
+        door_wide_open_time_s: Duration wide open [s] (default 90 = 1.5 min)
+        door_closed_time_s: Time to close the door [s] (default 210 = 3.5 min;
+            set to None to leave the door cracked indefinitely)
         Cd: Discharge coefficient
         A_leak_m2: Leakage area when closed [m²]
         max_effective_area_m2: Cap A_eff at downstream restriction [m²]
@@ -47,7 +49,8 @@ class InletRestrictionConfig:
 
     # For more control, use door_opening_func in Chimney instead
     door_cracked_percent: Optional[float] = None
-    door_wide_open_time_s: float = 90.0
+    door_wide_open_time_s: float = 90.0   # 1.5 min: door cracks open
+    door_closed_time_s: Optional[float] = 210.0  # 3.5 min: door fully closes
 
     Cd: float = 0.62
 
@@ -570,13 +573,22 @@ class Chimney:
             door_opening_func is None):
             cracked_pct = self.inlet_restriction.door_cracked_percent
             wide_open_time = self.inlet_restriction.door_wide_open_time_s
+            closed_time = self.inlet_restriction.door_closed_time_s
+
+            events = [(0, 100.0), (wide_open_time, cracked_pct)]
+            if closed_time is not None and closed_time > wide_open_time:
+                events.append((closed_time, 0.0))
 
             self.door_opening_func = make_smooth_door_schedule(
-                events=[(0, 100.0), (wide_open_time, cracked_pct)],
+                events=events,
                 ramp_open_to_cracked_s=5.0,
             )
-            print(f"[DOOR] Dynamic door schedule: 100% open for {wide_open_time:.0f}s, "
-                  f"then {cracked_pct:.0f}% cracked")
+            if closed_time is not None and closed_time > wide_open_time:
+                print(f"[DOOR] Dynamic door schedule: 100% open for {wide_open_time:.0f}s, "
+                      f"then {cracked_pct:.0f}% cracked, then closed at {closed_time:.0f}s")
+            else:
+                print(f"[DOOR] Dynamic door schedule: 100% open for {wide_open_time:.0f}s, "
+                      f"then {cracked_pct:.0f}% cracked")
 
         elif door_opening_func is not None and self.inlet_restriction.enable:
             print(f"[DOOR] Custom door opening function enabled")
@@ -2563,14 +2575,13 @@ class Chimney:
             'mdot': _mdot,
         }
 
-    def get_frontend_outputs(self, parts_to_plot):
+    def get_frontend_outputs(self):
         """Build JSON-serializable payload of risk classifications, SS extremes, and plot data.
 
         Call after run_simulation(). Reads instance attributes (T_gas, time_array, parts, ...).
 
-        Args:
-            parts_to_plot: 1-based part indices for the temperature plot (e.g. [1, 3, 4]).
-                Max 5 entries, no duplicates, each in [1, len(self.parts)].
+        The temperature plot always shows the middle of the first part (labeled "Part 1")
+        and the middle of the last part (labeled "Part N", where N = len(self.parts)).
 
         Returns:
             dict with keys:
@@ -2582,15 +2593,6 @@ class Chimney:
                 temperature_plot           {time_min, series: [{label, temperature_C}, ...]}
         """
         n_parts = len(self.parts)
-        if not isinstance(parts_to_plot, (list, tuple)) or len(parts_to_plot) == 0:
-            raise ValueError("parts_to_plot must be a non-empty list of 1-based part indices")
-        if len(parts_to_plot) > 5:
-            raise ValueError(f"parts_to_plot has {len(parts_to_plot)} entries; maximum is 5")
-        if len(set(parts_to_plot)) != len(parts_to_plot):
-            raise ValueError("parts_to_plot contains duplicates")
-        for p in parts_to_plot:
-            if not isinstance(p, int) or p < 1 or p > n_parts:
-                raise ValueError(f"parts_to_plot entry {p!r} out of range [1, {n_parts}]")
 
         n_steps = self.T_gas.shape[0]
         time_s = self.time_array
@@ -2650,13 +2652,14 @@ class Chimney:
             backdraft_duration_s = float((static_pressure_Pa[early_mask] < -THRESH_BACKDRAFT_PA).sum()) * self.dt
             backdraft_risk = "medium" if backdraft_duration_s > BACKDRAFT_DURATION_S else "low"
 
-        # Mid-segment temperature series per selected part.
+        # Mid-segment temperature series for the first and last parts only.
         part_ranges = []
         s0 = 0
         for part in self.parts:
             part_ranges.append((s0, s0 + part.num_segments))
             s0 += part.num_segments
 
+        parts_to_plot = [1, n_parts] if n_parts > 1 else [1]
         series = []
         for part_num in parts_to_plot:
             seg_lo, seg_hi = part_ranges[part_num - 1]
