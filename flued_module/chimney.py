@@ -489,6 +489,7 @@ class Chimney:
                  fittings_thermal: Optional[Dict[str, Any]] = None,
                  solver_relaxation: Optional[float] = None,
                  solver_alpha_cap: Optional[float] = None,
+                 elevation_ft: float = 0.0,
                  verbose: bool = False):
         """Initialize chimney simulation.
 
@@ -507,6 +508,10 @@ class Chimney:
             enable_diagnostics: Record per-timestep momentum/energy budgets
             momentum_config: Dict or MomentumConfig for momentum physics
             room_plenum: Dict or RoomPlenum for room depressurization
+            elevation_ft: Site elevation above sea level [ft]. Used to compute
+                ambient pressure via the ISA barometric formula; overrides any
+                Pa value supplied in per-part dicts. Default 0 ft (sea level,
+                101325 Pa). For LBNL lab use elevation_ft=787 (~98457 Pa).
             fittings_thermal: Dict for fitting thermal model config
         """
         self.inlet_temp_csv = inlet_temp_csv
@@ -516,6 +521,13 @@ class Chimney:
         self.dt = dt
         self.total_time = total_time
         self.time_steps = int(total_time / dt)
+
+        # Site elevation -> ambient pressure (ISA barometric formula).
+        # Overrides any per-part Pa so all downstream physics sees one site pressure.
+        self.elevation_ft = elevation_ft
+        self.elevation_m = elevation_ft * 0.3048
+        self.Pa_ambient = PhysicalProperties.pressure_from_elevation(self.elevation_m)
+        parts = [{**part, 'Pa': self.Pa_ambient} for part in parts]
 
         self.parts = [ChimneyPart(**part) for part in parts]
 
@@ -2575,22 +2587,41 @@ class Chimney:
             'mdot': _mdot,
         }
 
-    def get_frontend_outputs(self):
-        """Build JSON-serializable payload of risk classifications, SS extremes, and plot data.
+    def get_frontend_outputs(self, parts_to_plot=None):
+        """Build JSON-serializable payload for the frontend.
 
         Call after run_simulation(). Reads instance attributes (T_gas, time_array, parts, ...).
 
-        The temperature plot always shows the middle of the first part (labeled "Part 1")
-        and the middle of the last part (labeled "Part N", where N = len(self.parts)).
+        The temperature plot shows the mid-segment of each part listed in `parts_to_plot`
+        (1-indexed positions in `self.parts`). Default: first + last part. Each series is
+        labeled with the user-visible component number, which counts every fitting in
+        `self.elbows` that sits at-or-before the part in the canvas order. So a layout of
+        [pipe, elbow, pipe] labels the two series "Part 1" and "Part 3" (the elbow occupies
+        position #2). With no fittings, labels match the parts-array index 1:1.
+
+        UL 103 result is PASS if the static pressure ever crosses the required draft
+        threshold (0.006 in.w.c./ft of vertical chimney, Section 25.1) during the run.
+
+        Max temperature and max static pressure are computed over the entire simulation,
+        not a steady-state window.
+
+        Args:
+            parts_to_plot: list of 1-indexed part numbers to include in the temperature
+                plot. Default = [1, len(self.parts)] (first + last).
 
         Returns:
-            dict with keys:
-                ul103_risk                 "low" | "medium" | "high"  (high = fails UL 103)
-                backdraft_risk             "low" | "medium" | "high"  (high = never established)
-                max_static_pressure_ss_Pa  float
-                max_temperature_ss_C       float
-                static_pressure_plot       {time_min, static_pressure_Pa}
-                temperature_plot           {time_min, series: [{label, temperature_C}, ...]}
+            dict with both the frontend contract names and legacy aliases for backward
+            compatibility:
+                ul103_risk                  "low" (PASS) | "high" (FAIL)
+                ul103_result                "PASS" | "FAIL"  (legacy alias)
+                ul103_required_Pa           float (threshold from Section 25.1)
+                backdraft_risk              "low" | "medium" | "high"
+                max_static_pressure_ss_Pa   float (max over full sim, +up = upward draft)
+                max_static_pressure_Pa      float  (legacy alias, identical value)
+                max_temperature_ss_C        float (max gas temp at first/last segment over full sim)
+                max_temperature_C           float  (legacy alias, identical value)
+                static_pressure_plot        {time_min, static_pressure_Pa}
+                temperature_plot            {time_min, series: [{label, temperature_C}, ...]}
         """
         n_parts = len(self.parts)
 
@@ -2606,74 +2637,84 @@ class Chimney:
 
         T_first = self.T_gas[:, 0]
         T_last = self.T_gas[:, -1]
-        T_signal = 0.5 * (T_first + T_last)
 
-        # Peak-based steady-state window defined by temperature alone.
-        # Pressure often spikes during startup transients before the chimney
-        # establishes real draft, so locking the SS window to T (the chimney
-        # is "operating" when T is near its peak) is more robust than
-        # requiring both signals to peak simultaneously.
-        SS_FRAC = 0.90
-        T_peak = T_signal.max()
-        in_ss = T_signal >= SS_FRAC * T_peak
-        if in_ss.any():
-            ss_idx = np.where(in_ss)[0]
-        else:
-            ss_idx = np.arange(int(0.8 * n_steps), n_steps)
-
-        max_static_pressure_ss_Pa = float(static_pressure_Pa[ss_idx].max())
-        max_temperature_ss_C = float(np.maximum(T_first[ss_idx], T_last[ss_idx]).max() - 273.15)
-        draft_at_ss = float(static_pressure_Pa[ss_idx].mean())
+        max_static_pressure_Pa = float(static_pressure_Pa.max())
+        max_temperature_C = float(np.maximum(T_first, T_last).max() - 273.15)
 
         # UL 103 draft requirement: 0.006 in.w.c. per ft of vertical chimney (Section 25.1).
+        # PASS if the static pressure ever crosses the threshold during the run.
         h_vert_m = sum(p.height_m for p in self.parts if p.orientation.lower() == 'vertical')
         ul_required_Pa = 0.006 * (h_vert_m * 3.28084) * 249.089
-        if ul_required_Pa > 0:
-            ratio = max_static_pressure_ss_Pa / ul_required_Pa
-            if ratio < 1.0:
-                ul103_risk = "high"
-            elif ratio < 1.5:
-                ul103_risk = "medium"
-            else:
-                ul103_risk = "low"
+        if ul_required_Pa > 0 and max_static_pressure_Pa >= ul_required_Pa:
+            ul103_result = "PASS"
         else:
-            ul103_risk = "high"
+            ul103_result = "FAIL"
 
         # Backdraft risk: high = never established, medium = early dip then recovered, low = clean.
+        # "Established" is judged from the second half of the run (proxy for settled draft).
         THRESH_ESTABLISHED_PA = 2.0
         THRESH_BACKDRAFT_PA = 0.5
         EARLY_WINDOW_S = 180.0
         BACKDRAFT_DURATION_S = 30.0
 
-        if draft_at_ss < THRESH_ESTABLISHED_PA:
+        late_mean_Pa = float(static_pressure_Pa[n_steps // 2:].mean())
+        if late_mean_Pa < THRESH_ESTABLISHED_PA:
             backdraft_risk = "high"
         else:
             early_mask = time_s < EARLY_WINDOW_S
             backdraft_duration_s = float((static_pressure_Pa[early_mask] < -THRESH_BACKDRAFT_PA).sum()) * self.dt
             backdraft_risk = "medium" if backdraft_duration_s > BACKDRAFT_DURATION_S else "low"
 
-        # Mid-segment temperature series for the first and last parts only.
+        # Mid-segment temperature series for each requested part. Default = first + last.
         part_ranges = []
         s0 = 0
         for part in self.parts:
             part_ranges.append((s0, s0 + part.num_segments))
             s0 += part.num_segments
 
-        parts_to_plot = [1, n_parts] if n_parts > 1 else [1]
+        if parts_to_plot is None:
+            parts_to_plot = [1, n_parts] if n_parts > 1 else [1]
+
+        # Display label = user-visible component number, counting fittings in self.elbows
+        # that sit at-or-before this part. A fitting "sits before pipe k" iff its
+        # between_parts[1] <= k (next-part index points at or before this pipe). Inlet
+        # tee with between_parts=[-1, 0] precedes pipe 0; elbow with between_parts=[0, 1]
+        # precedes pipe 1; etc. Falls back to plain "Part k" if no elbows are stored.
+        def _display_label(part_idx):
+            n_before = 0
+            for elbow_dict in (self.elbows or []):
+                bp = elbow_dict.get('between_parts')
+                if not isinstance(bp, (list, tuple)) or len(bp) < 2:
+                    continue
+                next_p = bp[1]
+                if isinstance(next_p, (int, float)) and 0 <= int(next_p) <= part_idx:
+                    n_before += 1
+            return part_idx + n_before + 1
+
         series = []
         for part_num in parts_to_plot:
             seg_lo, seg_hi = part_ranges[part_num - 1]
             mid_seg = seg_lo + (seg_hi - seg_lo) // 2
             series.append({
-                "label": f"Part {part_num}",
+                "label": f"Part {_display_label(part_num - 1)}",
                 "temperature_C": (self.T_gas[:, mid_seg] - 273.15).tolist(),
             })
 
+        # PASS/FAIL -> low/high so the frontend RiskBadge has a level to render.
+        ul103_risk = "low" if ul103_result == "PASS" else "high"
+
         return {
+            # Contract names the frontend reads:
             "ul103_risk": ul103_risk,
+            "max_static_pressure_ss_Pa": max_static_pressure_Pa,
+            "max_temperature_ss_C": max_temperature_C,
+            # Legacy aliases (kept so existing notebooks/diagnostics keep working):
+            "ul103_result": ul103_result,
+            "max_static_pressure_Pa": max_static_pressure_Pa,
+            "max_temperature_C": max_temperature_C,
+            # Shared:
+            "ul103_required_Pa": float(ul_required_Pa),
             "backdraft_risk": backdraft_risk,
-            "max_static_pressure_ss_Pa": max_static_pressure_ss_Pa,
-            "max_temperature_ss_C": max_temperature_ss_C,
             "static_pressure_plot": {
                 "time_min": time_min.tolist(),
                 "static_pressure_Pa": static_pressure_Pa.tolist(),

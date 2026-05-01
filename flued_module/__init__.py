@@ -15,7 +15,7 @@ from .diagnostics_recorder import DiagnosticsRecorder
 from .coupled_solver import MomentumConfig
 from .room_plenum import RoomPlenumConfig
 
-__version__ = "1.0.0"
+__version__ = "1.2.0"
 __author__ = "Converted from FLUESIM5.BAS"
 
 __all__ = [
