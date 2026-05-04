@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "flued-dynamics"
-version = "1.2.0"
+version = "1.2.1"
 description = "Transient heat transfer and buoyancy-driven flow simulation for chimney/flue systems"
 readme = "README.md"
 license = {text = "MIT"}

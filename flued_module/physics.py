@@ -12,8 +12,25 @@ class PhysicalProperties:
     
     # STANDARD CONDITIONS (for reference)
     T_STD = 273.15  # Standard temperature in K (0°C)
-    P_STD = 98457.0  # Atmospheric pressure at lab elevation (Pa)
-    
+    P_STD = 101325.0  # Standard atmospheric pressure at sea level (Pa)
+
+    @staticmethod
+    def pressure_from_elevation(elevation_m):
+        """Atmospheric pressure from site elevation via the ISA barometric formula.
+
+        Args:
+            elevation_m: Elevation above sea level in meters. Valid for the
+                troposphere (h < 11 km).
+
+        Returns:
+            Ambient pressure in Pa.
+        """
+        P0 = 101325.0   # Pa, sea level
+        T0 = 288.15     # K
+        L = 0.0065      # K/m, lapse rate
+        EXP = 5.2561    # g*M/(R*L)
+        return P0 * (1.0 - L * elevation_m / T0) ** EXP
+
     @staticmethod
     def air_density(temperature_K, pressure_Pa=P_STD):
         """Air density from ideal gas law.
