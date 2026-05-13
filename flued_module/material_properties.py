@@ -186,20 +186,21 @@ class MaterialProperties:
     def __init__(self, json_path: Optional[str] = None):
         """Initialize with path to properties JSON file.
 
-        If no path provided, uses the default pipe_props.json from the package data directory.
+        If no path provided, uses the default pipe_props.json from dev/exp_data/.
         """
         self.materials: Dict[str, MaterialData] = {}
         self.configurations: Dict[str, Any] = {}
         self.surface_properties: Dict[str, Any] = {}
         self.condensation_properties: Dict[str, Any] = {}
+        self.vent_options: Dict[str, Any] = {}
 
         # Find the JSON file
         if json_path is not None:
             self.json_path = Path(json_path)
         else:
-            # Default: look in package data directory
+            # Default: look in dev/exp_data (one level above the flued_module package)
             package_dir = Path(__file__).parent
-            self.json_path = package_dir / "data" / "pipe_props.json"
+            self.json_path = package_dir.parent / "dev" / "exp_data" / "pipe_props.json"
 
         if self.json_path.exists():
             self.load_properties()
@@ -207,8 +208,9 @@ class MaterialProperties:
             # Try alternate paths for backward compatibility
             alt_paths = [
                 Path("pipe_props.json"),
-                Path("flued_module") / "pipe_props.json",
+                Path("dev") / "exp_data" / "pipe_props.json",
                 Path("flued_module") / "data" / "pipe_props.json",
+                Path("flued_module") / "pipe_props.json",
             ]
             for alt_path in alt_paths:
                 if alt_path.exists():
@@ -241,6 +243,7 @@ class MaterialProperties:
         self.configurations = data.get("pipe_configurations", {})
         self.surface_properties = data.get("surface_properties", {})
         self.condensation_properties = data.get("condensation_properties", {})
+        self.vent_options = data.get("vent_options", {})
 
     def get_material(self, name: str) -> Optional[MaterialData]:
         """Get material by name"""
@@ -516,6 +519,115 @@ class MaterialProperties:
             height_ft=height_ft,
             material=material,
             **kwargs
+        )
+
+    def list_vent_options(self) -> List[Dict[str, Any]]:
+        """Return the catalog for a frontend dropdown.
+
+        Each entry has the selectable key plus display fields. The frontend
+        sends back the `key`, geometry, and operating conditions; the backend
+        does the rest via create_chimney_part_from_vent_option.
+        """
+        out = []
+        for key, spec in self.vent_options.items():
+            out.append({
+                "key": key,
+                "name": spec.get("name", key),
+                "description": spec.get("description", ""),
+                "construction": spec.get("construction"),
+                "simulator_type": spec.get("simulator_type"),
+                "max_flue_temp_C": spec.get("max_flue_temp_C"),
+                "surface_finish": spec.get("surface_finish"),
+            })
+        return out
+
+    def get_vent_option(self, vent_key: str) -> Dict[str, Any]:
+        """Return raw vent_options entry for a given key."""
+        if vent_key not in self.vent_options:
+            available = ", ".join(sorted(self.vent_options.keys()))
+            raise ValueError(
+                f"Vent option '{vent_key}' not found. Available: {available}"
+            )
+        return self.vent_options[vent_key]
+
+    def create_chimney_part_from_vent_option(self,
+                                             vent_key: str,
+                                             inner_diameter_ft: float,
+                                             height_ft: float,
+                                             z_ft: float = 0,
+                                             orientation: str = "vertical",
+                                             T_ambient_K: float = 293.15,
+                                             Pa: float = 98457,
+                                             num_segments: int = 10,
+                                             **kwargs) -> Dict[str, Any]:
+        """Build a ChimneyPart dict from a vent catalog key.
+
+        The user picks a vent name in the frontend; this resolves the catalog
+        entry's layers (material + thickness) and returns a dict compatible
+        with Chimney(parts=[...]).
+
+        simulator_type=="single" -> single-wall: uses the inner layer only.
+        simulator_type=="triple" -> triple-wall: uses inner/middle/outer
+            layers. For double-wall vents the middle layer is `air` with a
+            finite thickness; air_gap_inner/outer are kept at 0 because the
+            gap is already represented as the middle layer.
+        """
+        spec = self.get_vent_option(vent_key)
+        sim_type = spec.get("simulator_type")
+        layers = spec.get("layers", {})
+        # Use the catalog's surface_finish to pick a roughness default; corrugated
+        # liners get the inner material's roughness (already higher in JSON).
+        kwargs.setdefault("humidity_ratio", 0.01)
+
+        if sim_type == "single":
+            inner = layers.get("inner")
+            if not inner:
+                raise ValueError(f"Vent '{vent_key}' has simulator_type=single but no 'inner' layer")
+            return self.create_chimney_part_dict(
+                pipe_type="single",
+                inner_diameter_ft=inner_diameter_ft,
+                height_ft=height_ft,
+                z_ft=z_ft,
+                orientation=orientation,
+                T_ambient_K=T_ambient_K,
+                Pa=Pa,
+                num_segments=num_segments,
+                material=inner["material"],
+                thickness_m=inner["thickness_m"],
+                **kwargs,
+            )
+
+        if sim_type == "triple":
+            inner = layers.get("inner")
+            middle = layers.get("middle")
+            outer = layers.get("outer")
+            missing = [n for n, l in (("inner", inner), ("middle", middle), ("outer", outer)) if not l]
+            if missing:
+                raise ValueError(
+                    f"Vent '{vent_key}' has simulator_type=triple but is missing layers: {missing}"
+                )
+            return self.create_chimney_part_dict(
+                pipe_type="triple",
+                inner_diameter_ft=inner_diameter_ft,
+                height_ft=height_ft,
+                z_ft=z_ft,
+                orientation=orientation,
+                T_ambient_K=T_ambient_K,
+                Pa=Pa,
+                num_segments=num_segments,
+                inner_material=inner["material"],
+                middle_material=middle["material"],
+                outer_material=outer["material"],
+                inner_thickness_m=inner["thickness_m"],
+                middle_thickness_m=middle["thickness_m"],
+                outer_thickness_m=outer["thickness_m"],
+                air_gap_inner_m=0.0,
+                air_gap_outer_m=0.0,
+                **kwargs,
+            )
+
+        raise ValueError(
+            f"Vent '{vent_key}' has unsupported simulator_type={sim_type!r} (expected 'single' or 'triple')"
         )
 
     def create_triple_wall_chimney_part(self,
