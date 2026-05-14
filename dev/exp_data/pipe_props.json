@@ -1,0 +1,483 @@
+{
+  "materials": {
+    "steel_24_gauge": {
+      "density_kg_m3": 7850,
+      "thermal_conductivity_W_m_K": 50,
+      "specific_heat_J_kg_K": 460,
+      "emissivity": 0.23,
+      "roughness_m": 0.00015,
+      "common_thickness_m": 0.00076,
+      "description": "24 gauge galvanized / cold-rolled carbon steel, new"
+    },
+    "stainless_316": {
+      "density_kg_m3": 8000,
+      "thermal_conductivity_W_m_K": 16,
+      "specific_heat_J_kg_K": 500,
+      "emissivity": 0.15,
+      "roughness_m": 0.000001,
+      "common_thickness_m": 0.0005,
+      "description": "316 stainless steel, new"
+    },
+    "stainless_430": {
+      "density_kg_m3": 7850,
+      "thermal_conductivity_W_m_K": 26,
+      "specific_heat_J_kg_K": 460,
+      "emissivity": 0.15,
+      "roughness_m": 0.000001,
+      "common_thickness_m": 0.0005,
+      "description": "430 stainless steel, new"
+    },
+    "stainless_304": {
+      "density_kg_m3": 8000,
+      "thermal_conductivity_W_m_K": 16,
+      "specific_heat_J_kg_K": 500,
+      "emissivity": 0.15,
+      "roughness_m": 0.000001,
+      "common_thickness_m": 0.0005,
+      "description": "304 stainless steel, new"
+    },
+    "stainless_444": {
+      "density_kg_m3": 7800,
+      "thermal_conductivity_W_m_K": 25,
+      "specific_heat_J_kg_K": 480,
+      "emissivity": 0.15,
+      "roughness_m": 0.000001,
+      "common_thickness_m": 0.0005,
+      "description": "444 super-ferritic stainless steel, new"
+    },
+    "aluminum": {
+      "density_kg_m3": 2700,
+      "thermal_conductivity_W_m_K": 237,
+      "specific_heat_J_kg_K": 900,
+      "emissivity": 0.05,
+      "roughness_m": 0.0000015,
+      "common_thickness_m": 0.001,
+      "description": "Aluminum, new polished"
+    },
+    "galvalume": {
+      "density_kg_m3": 7800,
+      "thermal_conductivity_W_m_K": 20,
+      "specific_heat_J_kg_K": 460,
+      "emissivity": 0.30,
+      "roughness_m": 0.0001,
+      "common_thickness_m": 0.00050,
+      "description": "Galvalume (55% Al, 43.5% Zn, 1.5% Si coated steel), new"
+    },
+    "satin_coat_steel": {
+      "density_kg_m3": 7850,
+      "thermal_conductivity_W_m_K": 50,
+      "specific_heat_J_kg_K": 460,
+      "emissivity": 0.25,
+      "roughness_m": 0.00001,
+      "common_thickness_m": 0.000457,
+      "description": "Satin-coat steel (thin Zn-coated, mill-finish), new"
+    },
+    "air": {
+      "density_kg_m3": 1.20,
+      "thermal_conductivity_W_m_K": 0.026,
+      "specific_heat_J_kg_K": 1005,
+      "emissivity": null,
+      "common_thickness_m": 0.0254,
+      "description": "Air gap (1 inch)"
+    },
+    "ceramic_fiber": {
+      "density_kg_m3": 100,
+      "thermal_conductivity_W_m_K": 0.04,
+      "specific_heat_J_kg_K": 1050,
+      "emissivity": 0.75,
+      "roughness_m": null,
+      "common_thickness_m": 0.025,
+      "description": "Ceramic fiber insulation blanket (thermal-tech)"
+    },
+    "mineral_wool": {
+      "density_kg_m3": 100,
+      "thermal_conductivity_W_m_K": 0.03,
+      "specific_heat_J_kg_K": 840,
+      "emissivity": 0.75,
+      "roughness_m": null,
+      "common_thickness_m": 0.025,
+      "description": "Mineral wool insulation"
+    },
+    "vermiculite": {
+      "density_kg_m3": 120,
+      "thermal_conductivity_W_m_K": 0.058,
+      "specific_heat_J_kg_K": 840,
+      "emissivity": 0.7,
+      "common_thickness_m": 0.025,
+      "description": "Vermiculite insulation"
+    },
+    "duraplus_middle_combined": {
+      "density_kg_m3": 200,
+      "thermal_conductivity_W_m_K": 0.0288,
+      "specific_heat_J_kg_K": 293,
+      "emissivity": 0.75,
+      "roughness_m": null,
+      "common_thickness_m": 0.0513,
+      "description": "Effective combined middle layer for DuraPlus 3-layer approximation: averages 1/2\" ceramic-fiber insulation + 0.018\" galvalume wall + 1.5\" air cooling gap. Preserves total thermal resistance (1.78 m^2.K/W) and total thermal capacity (~3020 J/(m^2.K)) of the actual 3-layer middle stack."
+    },
+    "clay_tile": {
+      "density_kg_m3": 1900,
+      "thermal_conductivity_W_m_K": 1.2,
+      "specific_heat_J_kg_K": 920,
+      "emissivity": 0.85,
+      "roughness_m": 0.0005,
+      "common_thickness_m": 0.020,
+      "description": "Terracotta clay flue tile (vitrified clay), ~7/8 in wall"
+    },
+    "brick_clay": {
+      "density_kg_m3": 1800,
+      "thermal_conductivity_W_m_K": 0.72,
+      "specific_heat_J_kg_K": 840,
+      "emissivity": 0.93,
+      "roughness_m": 0.003,
+      "common_thickness_m": 0.102,
+      "description": "Clay brick masonry chase, ~4 in (single-wythe) wall"
+    },
+    "clay_tile_plus_vermiculite": {
+      "density_kg_m3": 1000,
+      "thermal_conductivity_W_m_K": 0.112,
+      "specific_heat_J_kg_K": 838,
+      "emissivity": 0.85,
+      "roughness_m": 0.0005,
+      "common_thickness_m": 0.045,
+      "description": "Combined inner layer for lined masonry chimney: 7/8 in clay-tile liner + 1 in vermiculite loose-fill insulation. Effective k preserves the series thermal resistance (0.401 m^2.K/W); effective rho*cp preserves the combined thermal capacity (~37,690 J/(m^2.K)). Emissivity and roughness inherit from the flue-facing liner."
+    },
+    "clay_tile_plus_mineral_wool": {
+      "density_kg_m3": 1000,
+      "thermal_conductivity_W_m_K": 0.070,
+      "specific_heat_J_kg_K": 824,
+      "emissivity": 0.85,
+      "roughness_m": 0.0005,
+      "common_thickness_m": 0.045,
+      "description": "Combined inner layer for lined masonry chimney: 7/8 in clay-tile liner + 1 in mineral-wool blanket insulation. Effective k preserves the series thermal resistance (0.642 m^2.K/W); effective rho*cp preserves the combined thermal capacity (~37,060 J/(m^2.K)). Emissivity and roughness inherit from the flue-facing liner."
+    }
+  },
+  "pipe_configurations": {
+    "single_wall": {
+      "description": "Single wall pipe configuration",
+      "layers": ["wall"],
+      "example_materials": {
+        "wall": "steel_24_gauge"
+      }
+    },
+    "triple_wall": {
+      "description": "Triple wall insulated pipe with air gaps",
+      "layers": ["inner_liner", "insulation",  "outer_shell"],
+      "example_materials": {
+        "inner_liner": "stainless_316",
+        "insulation": "ceramic_fiber",
+        "outer_shell": "stainless_430"
+      },
+      "typical_air_gaps_m": {
+        "inner_air_gap": 0.003,
+        "outer_air_gap": 0.003
+      }
+    }
+  },
+  "surface_properties": {
+    "roughness_m": {
+      "smooth_stainless": 1e-6,
+      "galvanized_steel": 1.5e-4,
+      "cast_iron": 2.5e-4,
+      "corroded_steel": 5e-4
+    },
+    "condensate_film_thickness_m": {
+      "typical": 5e-5,
+      "maximum": 1e-4,
+      "vertical_smooth": 5e-5,
+      "vertical_rough": 8e-5,
+      "horizontal_bottom": 1e-4,
+      "inclined": 7e-5
+    }
+  },
+  "seam_configurations": {
+    "welded": {
+      "K_loss": 0.0,
+      "spacing_m": null,
+      "description": "Fully welded seams, no additional resistance"
+    },
+    "spiral_lock": {
+      "K_loss": 0.02,
+      "spacing_m": 0.3,
+      "description": "Spiral lock seam every 30cm"
+    },
+    "snap_lock": {
+      "K_loss": 0.05,
+      "spacing_m": 1.2,
+      "description": "Snap-lock joints every 4 ft section"
+    },
+    "crimped": {
+      "K_loss": 0.03,
+      "spacing_m": 1.2,
+      "description": "Crimped joints every 4 ft"
+    },
+    "gasketed": {
+      "K_loss": 0.08,
+      "spacing_m": 1.2,
+      "description": "Gasketed joints with step"
+    }
+  },
+  "condensation_properties": {
+    "steel_24_gauge": {
+      "max_film_thickness_m": 5e-5,
+      "description": "Typical for vertical galvanized steel"
+    },
+    "stainless_316": {
+      "max_film_thickness_m": 3e-5,
+      "description": "Smooth surface allows thinner film"
+    },
+    "stainless_430": {
+      "max_film_thickness_m": 3e-5,
+      "description": "Smooth surface allows thinner film"
+    },
+    "stainless_304": {
+      "max_film_thickness_m": 3e-5,
+      "description": "Smooth surface allows thinner film"
+    },
+    "stainless_444": {
+      "max_film_thickness_m": 3e-5,
+      "description": "Smooth surface allows thinner film"
+    },
+    "aluminum": {
+      "max_film_thickness_m": 2e-5,
+      "description": "Very smooth, hydrophobic surface"
+    }
+  },
+  "vent_options": {
+    "stovepipe-carbon-steel": {
+      "name": "Stovepipe",
+      "category": "stove_pipe",
+      "construction": "single-wall",
+      "simulator_type": "single",
+      "max_flue_temp_C": 760,
+      "surface_finish": "smooth",
+      "layers": {
+        "inner": { "material": "steel_24_gauge", "thickness_m": 0.000607 }
+      },
+      "description": "Single-wall stove pipe connector, 24-gauge cold rolled (typically black-painted) carbon steel. Smooth interior."
+    },
+    "stovepipe-stainless": {
+      "name": "Stainless Steel Stovepipe",
+      "category": "stove_pipe",
+      "construction": "single-wall",
+      "simulator_type": "single",
+      "max_flue_temp_C": 760,
+      "surface_finish": "smooth",
+      "layers": {
+        "inner": { "material": "stainless_430", "thickness_m": 0.000508 }
+      },
+      "description": "Single-wall stove pipe connector, 0.020\" 430 stainless steel. Smooth interior."
+    },
+    "flexible-liner-smooth": {
+      "name": "Smooth wall flexible stainless steel liner",
+      "category": "stove_pipe",
+      "construction": "single-wall",
+      "simulator_type": "single",
+      "max_flue_temp_C": 760,
+      "surface_finish": "smooth",
+      "layers": {
+        "inner": { "material": "stainless_430", "thickness_m": 0.000127 }
+      },
+      "description": "Smooth-wall flexible stainless steel liner, 0.005\" overlapped construction."
+    },
+    "flexible-liner-corrugated": {
+      "name": "Corrugated flexible stainless steel liner",
+      "category": "stove_pipe",
+      "construction": "single-wall",
+      "simulator_type": "single",
+      "max_flue_temp_C": 760,
+      "surface_finish": "corrugated",
+      "corrugation": {
+        "type": "spiral",
+        "depth_m": 0.003,
+        "pitch_m": 0.012
+      },
+      "layers": {
+        "inner": { "material": "stainless_316", "thickness_m": 0.000127 }
+      },
+      "description": "Corrugated flexible 316 stainless steel liner, 0.005\" overlapped construction."
+    },
+    "stovepipe-double-wall-galvanized": {
+      "name": "Double wall stovepipe",
+      "category": "stove_pipe",
+      "construction": "double-wall",
+      "simulator_type": "triple",
+      "max_flue_temp_C": 760,
+      "surface_finish": "smooth",
+      "layers": {
+        "inner":  { "material": "stainless_430",  "thickness_m": 0.000406 },
+        "middle": { "material": "air",            "thickness_m": 0.01270 },
+        "outer":  { "material": "steel_24_gauge", "thickness_m": 0.000457 }
+      },
+      "description": "Double-wall stove pipe connector: 0.016\" 430 stainless inner / ~1/2\" air gap / 0.018\" galvanized outer."
+    },
+    "stovepipe-double-wall-laser-welded": {
+      "name": "Laser-welded double wall stovepipe",
+      "category": "stove_pipe",
+      "construction": "double-wall",
+      "simulator_type": "triple",
+      "max_flue_temp_C": 760,
+      "surface_finish": "smooth",
+      "layers": {
+        "inner":  { "material": "stainless_430",    "thickness_m": 0.000406 },
+        "middle": { "material": "air",              "thickness_m": 0.01111 },
+        "outer":  { "material": "satin_coat_steel", "thickness_m": 0.000457 }
+      },
+      "description": "Laser-welded double-wall stove pipe connector: 0.016\" 430 stainless inner / 7/16\" air gap / 0.018\" satin-coat steel outer."
+    },
+    "pellet-vent": {
+      "name": "Vent for pellet appliances",
+      "category": "chimney",
+      "construction": "double-wall",
+      "simulator_type": "triple",
+      "max_flue_temp_C": 540,
+      "surface_finish": "smooth",
+      "layers": {
+        "inner":  { "material": "stainless_430", "thickness_m": 0.000305 },
+        "middle": { "material": "air",           "thickness_m": 0.01496 },
+        "outer":  { "material": "galvalume",     "thickness_m": 0.000457 }
+      },
+      "description": "Double-wall pellet appliance vent: stainless inner / air gap / galvalume outer."
+    },
+    "pellet-vent-laser-welded": {
+      "name": "Laser-welded vent for pellet appliances",
+      "category": "chimney",
+      "construction": "double-wall",
+      "simulator_type": "triple",
+      "max_flue_temp_C": 540,
+      "surface_finish": "smooth",
+      "layers": {
+        "inner":  { "material": "stainless_444", "thickness_m": 0.000305 },
+        "middle": { "material": "air",           "thickness_m": 0.01194 },
+        "outer":  { "material": "galvalume",     "thickness_m": 0.000457 }
+      },
+      "description": "Laser-welded double-wall pellet appliance vent: 0.012\" 444 stainless inner / air gap / 0.018\" laser-welded galvalume outer."
+    },
+    "chimney-double-wall-air-cooled": {
+      "name": "Double Wall Air Cooled Chimney Pipe",
+      "category": "chimney",
+      "construction": "double-wall",
+      "simulator_type": "triple",
+      "max_flue_temp_C": 760,
+      "surface_finish": "smooth",
+      "layers": {
+        "inner":  { "material": "stainless_430",  "thickness_m": 0.000406 },
+        "middle": { "material": "air",            "thickness_m": 0.0254 },
+        "outer":  { "material": "steel_24_gauge", "thickness_m": 0.000508 }
+      },
+      "description": "Double-wall air-cooled chimney pipe (no insulation): 0.016\" 430 stainless inner / ~1\" air-cooling gap / 0.020\" galvanized or galvalume outer."
+    },
+    "chimney-class-a-stainless": {
+      "name": "Double Wall Insulated Chimney Pipe (Stainless Outer)",
+      "category": "chimney",
+      "construction": "triple-wall",
+      "simulator_type": "triple",
+      "max_flue_temp_C": 1149,
+      "surface_finish": "smooth",
+      "layers": {
+        "inner":  { "material": "stainless_430", "thickness_m": 0.000508 },
+        "middle": { "material": "ceramic_fiber", "thickness_m": 0.0254 },
+        "outer":  { "material": "stainless_430", "thickness_m": 0.000406 }
+      },
+      "description": "Class A insulated chimney pipe: 0.020\" 430 stainless inner / 1\" thermal-tech ceramic-fiber blanket / 0.016\" 430 stainless outer."
+    },
+    "chimney-class-a-galvalume": {
+      "name": "Double Wall Insulated Chimney Pipe (Galvalume Outer)",
+      "category": "chimney",
+      "construction": "triple-wall",
+      "simulator_type": "triple",
+      "max_flue_temp_C": 1149,
+      "surface_finish": "smooth",
+      "layers": {
+        "inner":  { "material": "stainless_430", "thickness_m": 0.000508 },
+        "middle": { "material": "ceramic_fiber", "thickness_m": 0.0254 },
+        "outer":  { "material": "galvalume",     "thickness_m": 0.000533 }
+      },
+      "description": "Class A insulated chimney pipe: 0.020\" 430 stainless inner / 1\" thermal-tech ceramic-fiber blanket / 0.021\" galvalume outer."
+    },
+    "chimney-class-a-large-stainless": {
+      "name": "Double Wall Insulated Chimney Pipe — Large Diameter (Stainless Outer)",
+      "category": "chimney",
+      "construction": "triple-wall",
+      "simulator_type": "triple",
+      "max_flue_temp_C": 1149,
+      "surface_finish": "smooth",
+      "layers": {
+        "inner":  { "material": "stainless_430", "thickness_m": 0.000686 },
+        "middle": { "material": "ceramic_fiber", "thickness_m": 0.0254 },
+        "outer":  { "material": "stainless_430", "thickness_m": 0.000686 }
+      },
+      "description": "Large-diameter Class A insulated chimney pipe: 0.027\" 430 stainless inner / 1\" thermal-tech ceramic-fiber blanket / 0.027\" 430 stainless outer."
+    },
+    "chimney-class-a-large-galvalume": {
+      "name": "Double Wall Insulated Chimney Pipe — Large Diameter (Galvalume Outer)",
+      "category": "chimney",
+      "construction": "triple-wall",
+      "simulator_type": "triple",
+      "max_flue_temp_C": 1149,
+      "surface_finish": "smooth",
+      "layers": {
+        "inner":  { "material": "stainless_430", "thickness_m": 0.000686 },
+        "middle": { "material": "ceramic_fiber", "thickness_m": 0.0254 },
+        "outer":  { "material": "galvalume",     "thickness_m": 0.000737 }
+      },
+      "description": "Large-diameter Class A insulated chimney pipe: 0.027\" 430 stainless inner / 1\" thermal-tech ceramic-fiber blanket / 0.029\" galvalume outer."
+    },
+    "chimney-triple-wall-air-cooled-insulated": {
+      "name": "Triple Wall Air Cooled Chimney Pipe (with insulation)",
+      "category": "chimney",
+      "construction": "triple-wall",
+      "simulator_type": "triple",
+      "max_flue_temp_C": 1149,
+      "surface_finish": "smooth",
+      "layers": {
+        "inner":  { "material": "stainless_430",            "thickness_m": 0.000406 },
+        "middle": { "material": "duraplus_middle_combined", "thickness_m": 0.0513 },
+        "outer":  { "material": "steel_24_gauge",           "thickness_m": 0.000457 }
+      },
+      "description": "Triple-wall air-cooled insulated Class A chimney pipe: 0.016\" 430 stainless inner / 1/2\" thermal-tech insulation + 1.5\" air cooling gap (with intermediate 0.018\" galvalume wall) / 0.018\" galvanized outer."
+    },
+    "lined-masonry-uninsulated": {
+      "name": "Lined Masonry Chimney (no insulation)",
+      "category": "lined_masonry_chimney",
+      "construction": "masonry",
+      "simulator_type": "triple",
+      "max_flue_temp_C": 1149,
+      "surface_finish": "smooth",
+      "layers": {
+        "inner":  { "material": "clay_tile",  "thickness_m": 0.020 },
+        "middle": { "material": "air",        "thickness_m": 0.038 },
+        "outer":  { "material": "brick_clay", "thickness_m": 0.102 }
+      },
+      "description": "Lined masonry chimney with no insulation: 7/8\" terracotta clay-tile flue liner / ~1.5\" air-filled void / 4\" clay brick chase. Inner cross-section is rectangular but the diameter input is treated as the round-equivalent (hydraulic) diameter."
+    },
+    "lined-masonry-vermiculite": {
+      "name": "Lined Masonry Chimney (vermiculite insulation)",
+      "category": "lined_masonry_chimney",
+      "construction": "masonry",
+      "simulator_type": "triple",
+      "max_flue_temp_C": 1149,
+      "surface_finish": "smooth",
+      "layers": {
+        "inner":  { "material": "clay_tile_plus_vermiculite", "thickness_m": 0.045 },
+        "middle": { "material": "air",                        "thickness_m": 0.013 },
+        "outer":  { "material": "brick_clay",                 "thickness_m": 0.102 }
+      },
+      "description": "Lined masonry chimney with vermiculite insulation around the liner. Approximated as 3 layers: combined clay-tile + 1\" vermiculite inner / ~1/2\" remaining air gap / 4\" brick chase. Inner cross-section is rectangular but the diameter input is treated as the round-equivalent (hydraulic) diameter."
+    },
+    "lined-masonry-mineral-wool": {
+      "name": "Lined Masonry Chimney (mineral wool insulation)",
+      "category": "lined_masonry_chimney",
+      "construction": "masonry",
+      "simulator_type": "triple",
+      "max_flue_temp_C": 1149,
+      "surface_finish": "smooth",
+      "layers": {
+        "inner":  { "material": "clay_tile_plus_mineral_wool", "thickness_m": 0.045 },
+        "middle": { "material": "air",                         "thickness_m": 0.013 },
+        "outer":  { "material": "brick_clay",                  "thickness_m": 0.102 }
+      },
+      "description": "Lined masonry chimney with mineral-wool insulation around the liner. Approximated as 3 layers: combined clay-tile + 1\" mineral-wool inner / ~1/2\" remaining air gap / 4\" brick chase. Inner cross-section is rectangular but the diameter input is treated as the round-equivalent (hydraulic) diameter."
+    }
+  }
+}
