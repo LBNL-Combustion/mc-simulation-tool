@@ -2693,11 +2693,11 @@ class Chimney:
 
         series = []
         for part_num in parts_to_plot:
-            seg_lo, seg_hi = part_ranges[part_num - 1]
-            mid_seg = seg_lo + (seg_hi - seg_lo) // 2
+            seg_lo, _seg_hi = part_ranges[part_num - 1]
+            bottom_seg = seg_lo
             series.append({
                 "label": f"Part {_display_label(part_num - 1)}",
-                "temperature_C": (self.T_gas[:, mid_seg] - 273.15).tolist(),
+                "temperature_C": (self.T_gas[:, bottom_seg] - 273.15).tolist(),
             })
 
         # PASS/FAIL -> low/high so the frontend RiskBadge has a level to render.
