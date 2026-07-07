@@ -26,9 +26,22 @@ class ComprehensiveHeatTransfer:
     
     STEFAN_BOLTZMANN = 5.67e-8  # W/(m²·K⁴)
     
-    def __init__(self, include_interlayer_radiation: bool = True):
+    def __init__(self, include_interlayer_radiation: bool = True,
+                 h_inner_multiplier: float = 1.0, h_outer_multiplier: float = 1.0,
+                 exact_radiation: bool = False, cylinder_nc_correction: bool = False,
+                 local_nc_length: bool = False, external_air_speed_m_s: float = 0.0):
         """Args:
             include_interlayer_radiation: enable inter-layer radiation in adaptive triple-wall solver.
+            h_inner_multiplier: scale factor on the internal (gas->wall) convective coefficient
+                (default 1.0 = unscaled).
+            h_outer_multiplier: scale factor on the external (wall->ambient) convective coefficient
+                (default 1.0 = unscaled).
+            exact_radiation: grey-body external radiation instead of the linearized 4*e*s*T^3 form.
+            cylinder_nc_correction: vertical-cylinder curvature correction on the Churchill-Chu
+                external natural-convection Nusselt number.
+            local_nc_length: use the local (leading-edge) natural-convection length per segment.
+            external_air_speed_m_s: ambient air speed [m/s] driving external forced convection
+                (Churchill-Bernstein cross-flow cylinder); 0 = natural convection only.
         """
         from .physics import PhysicalProperties
         self.physics = PhysicalProperties()
@@ -45,6 +58,14 @@ class ComprehensiveHeatTransfer:
         # Internal radiation (gas <-> inner wall) always enabled;
         # per-segment emissivity read from wall_properties.
         self.include_internal_radiation = True
+
+        self.h_inner_multiplier = h_inner_multiplier
+        self.h_outer_multiplier = h_outer_multiplier
+        self.exact_radiation = exact_radiation                # grey-body h_rad vs linearized 4*e*s*T^3
+        self.cylinder_nc_correction = cylinder_nc_correction  # vertical-cylinder curvature on Churchill-Chu
+        self.local_nc_length = local_nc_length                # leading-edge (local) nat-conv length per segment
+        self.external_air_speed_m_s = external_air_speed_m_s  # external air speed for Churchill-Bernstein
+                                                              # forced convection (0 = natural convection only)
     
     
     def gas_properties(self, temperature_K: float, pressure_Pa: float = 98457) -> FlowProperties:
@@ -174,10 +195,63 @@ class ComprehensiveHeatTransfer:
         return (h_forced**n + h_natural**n)**(1/n)
     
     def radiation_heat_transfer_coefficient(self, T_surface: float, T_ambient: float,
-                                          emissivity: float) -> float:
-        """Linearized radiation h_rad [W/(m2*K)]."""
+                                          emissivity: float, exact: bool = False) -> float:
+        """Effective radiation h_rad [W/(m2*K)].
+
+        Linearized (default): 4*e*s*T_avg^3 -- valid only when T_surface ~ T_ambient.
+        Exact grey-body:      e*s*(Ts^4 - Ta^4)/(Ts - Ta) -- correct at large surface-to-
+        surround differences (e.g. a hot single-wall stovepipe in a room), where the
+        linearization under-predicts by ~10%.
+        """
+        if exact and abs(T_surface - T_ambient) > 1.0:
+            return emissivity * self.STEFAN_BOLTZMANN * (T_surface**4 - T_ambient**4) / (T_surface - T_ambient)
         T_avg = (T_surface + T_ambient) / 2
         return 4 * emissivity * self.STEFAN_BOLTZMANN * T_avg**3
+
+    def _external_coefficient(self, T_surf_K, T_ambient_K, emissivity, orientation,
+                              part_height, outer_diameter, x_from_start, film_props):
+        """External wall->ambient coefficient (natural convection + radiation), W/(m2*K).
+
+        Optional physics refinements (set in __init__, default off):
+          exact_radiation        -- grey-body h_rad instead of the 4*e*s*T^3 linearization.
+          cylinder_nc_correction -- vertical-cylinder curvature enhancement on Churchill-Chu
+                                    (Incropera 9.6.1: the plate result is valid only for
+                                    D/L >= 35/Gr_L^(1/4); below that, curvature raises Nu).
+          local_nc_length        -- leading-edge/local length: laminar local h ~ x^(-1/4),
+                                    so the height-averaged coefficient is redistributed toward
+                                    the developing base. The 0.75*(L/x)^(1/4) factor integrates
+                                    to 1 over 0..L, i.e. it conserves the part-height average.
+        """
+        is_vert = orientation.lower() == 'vertical'
+        L_ext = part_height if is_vert else outer_diameter
+        Gr = self.grashof_number(L_ext, T_surf_K, T_ambient_K, film_props)
+        Ra = self.rayleigh_number(Gr, self.prandtl_number(film_props))
+        Nu = self.nusselt_natural_convection_external(Ra, orientation)
+        h_conv = Nu * film_props.thermal_conductivity / L_ext
+        if is_vert and Gr > 0.0:
+            if self.cylinder_nc_correction and outer_diameter > 0.0:
+                crit = 35.0 / (Gr ** 0.25)          # threshold value of D/L
+                DL = outer_diameter / L_ext
+                if DL < crit:
+                    F = 1.0 + 0.30 * ((crit / DL) - 1.0) ** 0.5
+                    h_conv *= min(F, 1.8)
+            if self.local_nc_length and part_height > 0.0:
+                x = max(x_from_start, 0.15 * part_height)   # floor avoids first-cell blow-up
+                h_conv *= min(0.75 * (part_height / x) ** 0.25, 2.5)
+        # Forced convection from external air movement (Churchill-Bernstein cross-flow
+        # cylinder), blended with natural convection via a Churchill-Usagi rule.
+        V_ext = getattr(self, 'external_air_speed_m_s', 0.0)
+        if V_ext > 0.0 and outer_diameter > 0.0 and film_props.viscosity > 0.0:
+            Re_d = film_props.density * V_ext * outer_diameter / film_props.viscosity
+            Pr_f = self.prandtl_number(film_props)
+            Nu_f = (0.3 + (0.62 * Re_d**0.5 * Pr_f**(1/3)) / (1 + (0.4/Pr_f)**(2/3))**0.25
+                    * (1 + (Re_d/282000.0)**(5/8))**(4/5))
+            h_forced = Nu_f * film_props.thermal_conductivity / outer_diameter
+            h_conv = (h_conv**3.5 + h_forced**3.5)**(1/3.5)
+        h_rad = self.radiation_heat_transfer_coefficient(
+            T_surf_K, T_ambient_K, emissivity, exact=self.exact_radiation)
+        h_outer = (h_conv + h_rad) * getattr(self, 'h_outer_multiplier', 1.0)
+        return max(h_outer, 1.0)
     
     def dew_point_temperature(self, pressure_Pa: float, humidity_ratio: float) -> float:
         """Dew point via binary search on saturation pressure.
@@ -589,23 +663,10 @@ class ComprehensiveHeatTransfer:
                 T_film_outer = (T_wall_current + T_ambient) / 2.0
                 film_props_outer = self.gas_properties(T_film_outer, pressure)
 
-                # Vertical: height-based Gr (standard for vertical surfaces)
-                # Horizontal: diameter-based Gr (standard for horizontal cylinders)
-                if orientation.lower() == 'vertical':
-                    L_ext = part_height
-                else:
-                    L_ext = outer_diameter
-
-                Gr_outer = self.grashof_number(L_ext, T_wall_current, T_ambient, film_props_outer)
-                Ra_outer = self.rayleigh_number(Gr_outer, self.prandtl_number(film_props_outer))
-                Nu_outer = self.nusselt_natural_convection_external(Ra_outer, orientation)
-                h_conv_outer = Nu_outer * film_props_outer.thermal_conductivity / L_ext
-
                 emissivity = wall_props.get('emissivity', 0.8)
-                h_rad_outer = self.radiation_heat_transfer_coefficient(T_wall_current, T_ambient, emissivity)
-                h_outer = h_conv_outer + h_rad_outer
-                h_outer *= getattr(self, 'h_outer_multiplier', 1.0)  # DIAG: sensitivity
-                h_outer = max(h_outer, 1.0)  # W/(m2*K)
+                h_outer = self._external_coefficient(
+                    T_wall_current, T_ambient, emissivity, orientation,
+                    part_height, outer_diameter, x_from_start, film_props_outer)
 
                 geometry = {
                     'inner_diameter': diameter,
@@ -631,21 +692,10 @@ class ComprehensiveHeatTransfer:
                 T_film_outer = (T_outer_current + T_ambient) / 2.0
                 film_props_outer = self.gas_properties(T_film_outer, pressure)
 
-                if orientation.lower() == 'vertical':
-                    L_ext = part_height
-                else:
-                    L_ext = outer_diameter
-
-                Gr_outer = self.grashof_number(L_ext, T_outer_current, T_ambient, film_props_outer)
-                Ra_outer = self.rayleigh_number(Gr_outer, self.prandtl_number(film_props_outer))
-                Nu_outer = self.nusselt_natural_convection_external(Ra_outer, orientation)
-                h_conv_outer = Nu_outer * film_props_outer.thermal_conductivity / L_ext
-
                 emissivity_outer = wall_props['outer'].get('emissivity', 0.8)
-                h_rad_outer = self.radiation_heat_transfer_coefficient(T_outer_current, T_ambient, emissivity_outer)
-                h_outer = h_conv_outer + h_rad_outer
-                h_outer *= getattr(self, 'h_outer_multiplier', 1.0)  # DIAG: sensitivity
-                h_outer = max(h_outer, 1.0)  # W/(m2*K)
+                h_outer = self._external_coefficient(
+                    T_outer_current, T_ambient, emissivity_outer, orientation,
+                    part_height, outer_diameter, x_from_start, film_props_outer)
 
                 geometry = {
                     'inner_diameter': diameter,

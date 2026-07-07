@@ -489,7 +489,10 @@ class Chimney:
                  fittings_thermal: Optional[Dict[str, Any]] = None,
                  solver_relaxation: Optional[float] = None,
                  solver_alpha_cap: Optional[float] = None,
-                 elevation_ft: float = 0.0,
+                 elevation_ft: Optional[float] = 0.0,
+                 h_inner_multiplier: float = 1.0,
+                 h_outer_multiplier: float = 1.0,
+                 external_ht_config: Optional[Dict[str, Any]] = None,
                  verbose: bool = False):
         """Initialize chimney simulation.
 
@@ -508,10 +511,12 @@ class Chimney:
             enable_diagnostics: Record per-timestep momentum/energy budgets
             momentum_config: Dict or MomentumConfig for momentum physics
             room_plenum: Dict or RoomPlenum for room depressurization
-            elevation_ft: Site elevation above sea level [ft]. Used to compute
-                ambient pressure via the ISA barometric formula; overrides any
-                Pa value supplied in per-part dicts. Default 0 ft (sea level,
-                101325 Pa). For LBNL lab use elevation_ft=787 (~98457 Pa).
+            elevation_ft: Site elevation above sea level [ft]. Sets the single
+                ambient pressure the flow solver uses.
+                * 0.0 -> ISA sea-level pressure (101325 Pa), applied to all parts.
+                * A number (e.g. 787 ~= 98476 Pa) -> ISA pressure at that elevation.
+                * None -> use the exact Pa supplied in the per-part dicts (e.g. a
+                  measured barometric pressure).
             fittings_thermal: Dict for fitting thermal model config
         """
         self.inlet_temp_csv = inlet_temp_csv
@@ -522,11 +527,17 @@ class Chimney:
         self.total_time = total_time
         self.time_steps = int(total_time / dt)
 
-        # Site elevation -> ambient pressure (ISA barometric formula).
-        # Overrides any per-part Pa so all downstream physics sees one site pressure.
+        # Site ambient pressure -> one site pressure (self.Pa_ambient) for all parts.
+        # elevation_ft=0.0 -> ISA sea-level pressure (101325 Pa); a number -> ISA
+        # pressure at that elevation; None -> use the per-part Pa values directly.
         self.elevation_ft = elevation_ft
-        self.elevation_m = elevation_ft * 0.3048
-        self.Pa_ambient = PhysicalProperties.pressure_from_elevation(self.elevation_m)
+        if elevation_ft is None:
+            self.elevation_m = 0.0
+            _part_pas = [p.get('Pa') for p in parts if p.get('Pa') is not None]
+            self.Pa_ambient = float(_part_pas[0]) if _part_pas else 101325.0
+        else:
+            self.elevation_m = elevation_ft * 0.3048
+            self.Pa_ambient = PhysicalProperties.pressure_from_elevation(self.elevation_m)
         parts = [{**part, 'Pa': self.Pa_ambient} for part in parts]
 
         self.parts = [ChimneyPart(**part) for part in parts]
@@ -546,7 +557,14 @@ class Chimney:
             print("Consider using a smaller time step if numerical instabilities occur.")
 
         self.physics = PhysicalProperties()
-        self.comprehensive_ht = ComprehensiveHeatTransfer()
+        _ext = external_ht_config or {}
+        self.comprehensive_ht = ComprehensiveHeatTransfer(
+            h_inner_multiplier=h_inner_multiplier,
+            h_outer_multiplier=h_outer_multiplier,
+            exact_radiation=_ext.get('exact_radiation', False),
+            cylinder_nc_correction=_ext.get('cylinder_nc_correction', False),
+            local_nc_length=_ext.get('local_nc_length', False),
+            external_air_speed_m_s=_ext.get('external_air_speed_m_s', 0.0))
 
         self.top_boundary = top_boundary if top_boundary is not None else {}
         self._wind_cfg = self._parse_wind_cap(self.top_boundary)
