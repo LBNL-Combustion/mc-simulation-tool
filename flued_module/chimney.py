@@ -79,7 +79,7 @@ class InletRestrictionConfig:
     inlet_area_mode: str = "linear"
 
     # "none": no additional cap; "pipe": cap at first part's pipe area
-    inlet_area_cap_mode: str = "none"
+    inlet_area_cap_mode: str = "pipe"
 
     K_loss_override: Optional[float] = None  # bypasses Cd calculation
 
