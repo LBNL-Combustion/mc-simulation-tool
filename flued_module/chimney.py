@@ -1030,7 +1030,7 @@ class Chimney:
             segment_length = part.height_m / part.num_segments
 
             rho_gas = self.density[step, seg]
-            rho_ambient = self.comprehensive_ht.gas_properties(part.T_ambient_K, part.Pa).density
+            rho_ambient = self.comprehensive_ht.gas_properties(self.parts[-1].T_ambient_K, part.Pa).density
 
             dp_buoyancy_seg = self.comprehensive_ht.buoyancy_pressure(
                 segment_length, rho_ambient, rho_gas
@@ -1083,7 +1083,7 @@ class Chimney:
             else:
                 segment_length = part.height_m / part.num_segments
                 rho_gas = self.density[step, seg]
-                rho_ambient = self.comprehensive_ht.gas_properties(part.T_ambient_K, part.Pa).density
+                rho_ambient = self.comprehensive_ht.gas_properties(self.parts[-1].T_ambient_K, part.Pa).density
                 dp_buoyancy = 9.81 * segment_length * (rho_ambient - rho_gas)
 
                 velocity = self.velocity[step, seg]
@@ -2364,7 +2364,7 @@ class Chimney:
 
             T_gas = self.T_gas[timestep, seg]
             rho_gas = self.density[timestep, seg]
-            rho_ambient = self.physics.air_density(part.T_ambient_K, part.Pa)
+            rho_ambient = self.physics.air_density(self.parts[-1].T_ambient_K, part.Pa)
             velocity = self.velocity[timestep, seg]
 
             if part.orientation.lower() == 'vertical':
@@ -2396,6 +2396,18 @@ class Chimney:
             buoyancy_above += seg_buoyancy[seg]
             friction_above += seg_friction[seg]
             dP_profile[seg] = -buoyancy_above + friction_above
+
+        # Gauge reference as in get_static_pressure_profile: room column at
+        # indoor nodes, outdoor column at outdoor nodes
+        T_outdoor_K = self.parts[-1].T_ambient_K
+        column_offset = 0.0
+        for seg in range(n_segs):
+            part_idx, local_seg, part = self.get_segment_info(seg)
+            if part.T_ambient_K != T_outdoor_K:
+                dP_profile[seg] += column_offset
+            rho_room = self.physics.air_density(part.T_ambient_K, part.Pa)
+            rho_outdoor = self.physics.air_density(T_outdoor_K, part.Pa)
+            column_offset += (rho_room - rho_outdoor) * 9.81 * self.segment_vertical_heights[seg]
 
         PA_PER_INWC = 249.09  # Pa per inWC
         dP_inWC = dP_profile / PA_PER_INWC
@@ -2457,7 +2469,11 @@ class Chimney:
         print("="*60)
 
     def get_static_pressure_profile(self, timestep=-1):
-        """Calculate static (gauge) pressure profile along the stack."""
+        """Calculate static (gauge) pressure profile along the stack.
+
+        Gauge is relative to the room air column at indoor nodes and the outdoor
+        air column at outdoor nodes (returned as P_ambient_Pa).
+        """
         if timestep == -1:
             timestep = self.time_steps
 
@@ -2473,13 +2489,27 @@ class Chimney:
             cumulative_height += self.segment_vertical_heights[seg]
         heights[n_segs] = cumulative_height
 
-        # Ambient pressure column: per-segment density from each part's T_ambient
+        # Room air column: per-segment density from each part's T_ambient
         P_ambient = np.zeros(n_segs + 1)
         P_ambient[0] = self.parts[0].Pa
         for seg in range(n_segs):
             part_idx, local_seg, part = self.get_segment_info(seg)
             rho_ambient = self.physics.air_density(part.T_ambient_K, part.Pa)
             P_ambient[seg + 1] = P_ambient[seg] - rho_ambient * 9.81 * self.segment_vertical_heights[seg]
+
+        # Outdoor air column from the same base pressure; the flue exits into it
+        T_outdoor_K = self.parts[-1].T_ambient_K
+        P_outdoor = np.zeros(n_segs + 1)
+        P_outdoor[0] = self.parts[0].Pa
+        # A node is outdoors when its part shares the last part's ambient temperature
+        node_outdoors = np.zeros(n_segs + 1, dtype=bool)
+        for seg in range(n_segs):
+            part_idx, local_seg, part = self.get_segment_info(seg)
+            rho_outdoor = self.physics.air_density(T_outdoor_K, part.Pa)
+            P_outdoor[seg + 1] = P_outdoor[seg] - rho_outdoor * 9.81 * self.segment_vertical_heights[seg]
+            node_outdoors[seg] = part.T_ambient_K == T_outdoor_K
+        node_outdoors[n_segs] = True
+        P_reference = np.where(node_outdoors, P_outdoor, P_ambient)
 
         P_inside = np.zeros(n_segs + 1)
         deltaP_wind = getattr(self, '_last_deltaP_wind_cap', 0.0)
@@ -2492,7 +2522,7 @@ class Chimney:
             v_exit = self.velocity[timestep, last_seg]
             dp_exit = K_exit * 0.5 * rho_exit * v_exit**2
 
-        P_inside[n_segs] = P_ambient[n_segs] + deltaP_wind + dp_exit
+        P_inside[n_segs] = P_outdoor[n_segs] + deltaP_wind + dp_exit
 
         total_dp_buoyancy = 0.0
         total_dp_friction = 0.0
@@ -2534,7 +2564,7 @@ class Chimney:
 
             # Accumulate totals for diagnostics
             # Buoyancy = ambient hydrostatic - gas hydrostatic (positive = upward draft)
-            rho_amb_seg = self.physics.air_density(part.T_ambient_K, part.Pa)
+            rho_amb_seg = self.physics.air_density(self.parts[-1].T_ambient_K, part.Pa)
             total_dp_buoyancy += (rho_amb_seg - rho_gas) * 9.81 * self.segment_vertical_heights[seg]
             total_dp_friction += dP_friction
             total_dp_fittings += dP_fitting
@@ -2581,13 +2611,13 @@ class Chimney:
             if _dp_room != 0.0:
                 P_inside[:] -= _dp_room
 
-        P_gauge = P_inside - P_ambient
+        P_gauge = P_inside - P_reference
 
         return {
             'height_m': heights,
             'P_gauge_Pa': P_gauge,
             'P_absolute_Pa': P_inside,
-            'P_ambient_Pa': P_ambient,
+            'P_ambient_Pa': P_reference,
             # Pressure component breakdown (all positive = reduces gauge pressure)
             'dp_buoyancy': total_dp_buoyancy,
             'dp_friction': total_dp_friction,
