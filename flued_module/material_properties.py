@@ -65,7 +65,7 @@ class PipeConfiguration:
     condensate_film_max_m: float = 5e-5
 
     # Computational
-    num_segments: int = 10
+    num_segments: Optional[int] = None
 
     @property
     def outer_diameter_m(self) -> float:
@@ -307,7 +307,7 @@ class MaterialProperties:
             humidity_ratio=kwargs.get("humidity_ratio", 0.01),
             roughness_m=roughness,
             condensate_film_max_m=kwargs.get("condensate_film_max_m", 5e-5),
-            num_segments=kwargs.get("num_segments", 10)
+            num_segments=kwargs.get("num_segments")
         )
 
     def create_single_wall_pipe(self,
@@ -368,7 +368,7 @@ class MaterialProperties:
                                  orientation: str = "vertical",
                                  T_ambient_K: float = 293.15,
                                  Pa: float = 98457,
-                                 num_segments: int = 10,
+                                 num_segments: Optional[int] = None,
                                  **kwargs) -> Dict[str, Any]:
         """
         Create a ChimneyPart dictionary directly from material names.
@@ -383,7 +383,7 @@ class MaterialProperties:
             orientation: 'vertical' or 'horizontal'
             T_ambient_K: Ambient temperature in Kelvin
             Pa: Atmospheric pressure in Pascals
-            num_segments: Number of computational segments
+            num_segments: Number of computational segments (default: about 0.3 m each)
 
         For single wall, use kwargs:
             material: Material name from pipe_props.json
@@ -558,7 +558,7 @@ class MaterialProperties:
                                              orientation: str = "vertical",
                                              T_ambient_K: float = 293.15,
                                              Pa: float = 98457,
-                                             num_segments: int = 10,
+                                             num_segments: Optional[int] = None,
                                              **kwargs) -> Dict[str, Any]:
         """Build a ChimneyPart dict from a vent catalog key.
 

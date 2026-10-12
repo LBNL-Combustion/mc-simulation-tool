@@ -143,7 +143,7 @@ class ChimneyPart:
     orientation: str  # 'vertical' or 'horizontal'
     T_ambient_K: float  # K
     Pa: float  # Pa
-    num_segments: int
+    num_segments: Optional[int] = None  # default: about 0.3 m per segment
 
     # SINGLE WALL PROPERTIES
     thickness_w_m: float = 0.001  # m
@@ -191,6 +191,8 @@ class ChimneyPart:
         self.inner_diameter_m = self.inner_diameter_ft * 0.3048
         self.height_m = self.height_ft * 0.3048
         self.z_m = self.z_ft * 0.3048
+        if self.num_segments is None:
+            self.num_segments = max(1, round(self.height_m / 0.3))
 
         self.inner_area_m2 = np.pi * (self.inner_diameter_m / 2) ** 2
         self.inner_perimeter_m = np.pi * self.inner_diameter_m
@@ -472,7 +474,7 @@ def make_smooth_door_schedule(events, ramp_open_to_cracked_s=5.0,
 class Chimney:
     """Main chimney simulation class."""
     
-    def __init__(self, parts: List[Dict[str, Any]], dt: float = 0.5, total_time: float = 60.0,
+    def __init__(self, parts: List[Dict[str, Any]], dt: float = 1.0, total_time: float = 60.0,
                  use_coupled_solver: bool = True, elbows: List[Dict[str, Any]] = None,
                  elbow_method: str = "K_sum", top_boundary: Optional[Dict[str, Any]] = None,
                  inlet_restriction: Optional[Dict[str, Any]] = None,
