@@ -511,11 +511,13 @@ class ComprehensiveHeatTransfer:
 
         if wall_type == 'single':
             T_wall_current = segment_data['wall_temperature']
+            T_wall_old = T_wall_current
         else:  # triple
             T_liner_current = segment_data['liner_temperature']
             T_middle_current = segment_data['middle_temperature']
             T_outer_current = segment_data['outer_temperature']
             T_wall_current = T_liner_current
+            T_layers_old = (T_liner_current, T_middle_current, T_outer_current)
 
         # Iterative coupling: wall temp <-> condensation <-> h
         for iteration in range(max_iterations):
@@ -614,8 +616,9 @@ class ComprehensiveHeatTransfer:
                     'extra_wall_Cj': extra_wall_Cj,
                 }
 
+                # Every pass solves the same step from the old wall state
                 T_wall_new = self.transient_wall_temperature(
-                    T_wall_current, T_gas, T_ambient, wall_props, geometry,
+                    T_wall_old, T_gas, T_ambient, wall_props, geometry,
                     h_inner_effective, h_outer, dt
                 )
 
@@ -654,7 +657,7 @@ class ComprehensiveHeatTransfer:
                 }
 
                 T_liner_new, T_middle_new, T_outer_new = self.transient_triple_wall_temperatures(
-                    T_liner_current, T_middle_current, T_outer_current, 
+                    *T_layers_old, 
                     T_gas, T_ambient, wall_props, geometry, 
                     h_inner_effective, h_outer, dt
                 )
