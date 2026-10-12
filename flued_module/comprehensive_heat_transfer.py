@@ -42,9 +42,10 @@ class ComprehensiveHeatTransfer:
 
         self.condensation_states = {}
 
-        # Internal radiation (gas <-> inner wall) always enabled;
-        # per-segment emissivity read from wall_properties.
+        # Internal radiation (gas <-> inner wall) always enabled. Flue gas is a weak
+        # emitter over a chimney diameter, so the exchange uses a gas emissivity.
         self.include_internal_radiation = True
+        self.gas_emissivity = 0.1
     
     
     def gas_properties(self, temperature_K: float, pressure_Pa: float = 98457) -> FlowProperties:
@@ -511,11 +512,13 @@ class ComprehensiveHeatTransfer:
 
         if wall_type == 'single':
             T_wall_current = segment_data['wall_temperature']
+            T_wall_old = T_wall_current
         else:  # triple
             T_liner_current = segment_data['liner_temperature']
             T_middle_current = segment_data['middle_temperature']
             T_outer_current = segment_data['outer_temperature']
             T_wall_current = T_liner_current
+            T_layers_old = (T_liner_current, T_middle_current, T_outer_current)
 
         # Iterative coupling: wall temp <-> condensation <-> h
         for iteration in range(max_iterations):
@@ -549,12 +552,8 @@ class ComprehensiveHeatTransfer:
 
             h_inner *= getattr(self, 'h_inner_multiplier', 1.0)  # DIAG: sensitivity
             # Internal radiation (gas <-> inner wall)
-            if wall_type == 'triple':
-                _eps_ir = wall_props.get('liner', {}).get('emissivity', 0.3)
-            else:
-                _eps_ir = wall_props.get('emissivity', 0.8)
             _T_avg_ir = (T_gas + T_wall_current) / 2.0
-            h_inner += 4.0 * _eps_ir * self.STEFAN_BOLTZMANN * _T_avg_ir**3
+            h_inner += 4.0 * self.gas_emissivity * self.STEFAN_BOLTZMANN * _T_avg_ir**3
 
             area = np.pi * diameter * thermal_length
             condensation_state = self.condensation_states[segment_id]
@@ -614,8 +613,9 @@ class ComprehensiveHeatTransfer:
                     'extra_wall_Cj': extra_wall_Cj,
                 }
 
+                # Every pass solves the same step from the old wall state
                 T_wall_new = self.transient_wall_temperature(
-                    T_wall_current, T_gas, T_ambient, wall_props, geometry,
+                    T_wall_old, T_gas, T_ambient, wall_props, geometry,
                     h_inner_effective, h_outer, dt
                 )
 
@@ -654,7 +654,7 @@ class ComprehensiveHeatTransfer:
                 }
 
                 T_liner_new, T_middle_new, T_outer_new = self.transient_triple_wall_temperatures(
-                    T_liner_current, T_middle_current, T_outer_current, 
+                    *T_layers_old, 
                     T_gas, T_ambient, wall_props, geometry, 
                     h_inner_effective, h_outer, dt
                 )

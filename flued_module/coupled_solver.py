@@ -306,7 +306,7 @@ class CoupledFlowThermalSolver:
         n_seg0 = part0.num_segments
         dp = 0.0
         for seg in range(n_seg0):
-            rho_amb = chimney.physics.air_density(part0.T_ambient_K, part0.Pa)
+            rho_amb = chimney.physics.air_density(chimney.parts[-1].T_ambient_K, part0.Pa)
             rho_hot = chimney.physics.air_density(T_inlet, part0.Pa)
             dp += (rho_amb - rho_hot) * g * chimney.segment_vertical_heights[seg]
         return dp
@@ -332,7 +332,7 @@ class CoupledFlowThermalSolver:
             segment_height = chimney.segment_vertical_heights[seg]
 
             if part_idx not in ambient_density_cache:
-                ambient_density_cache[part_idx] = chimney.physics.air_density(part.T_ambient_K, part.Pa)
+                ambient_density_cache[part_idx] = chimney.physics.air_density(chimney.parts[-1].T_ambient_K, part.Pa)
             rho_ambient = ambient_density_cache[part_idx]
 
             buoyancy[seg] = chimney.physics.GRAVITY * segment_height * (rho_ambient - densities[seg])

@@ -95,7 +95,7 @@ def run_simulation(config: dict) -> dict:
     total_time = config['total_time']
 
     # --- Optional with defaults ---
-    dt = config.get('dt', 0.5)
+    dt = config.get('dt', 1.0)
     elbows = config.get('elbows', None)
     inlet_restriction = config.get('inlet_restriction', None)
     top_boundary = config.get('top_boundary', None)

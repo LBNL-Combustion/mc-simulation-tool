@@ -56,7 +56,7 @@ class DraftAnalyzer:
                 seg_length = self.chimney.segment_lengths[seg]
 
                 T_gas = self.chimney.T_gas[step, seg]
-                T_ambient = part.T_ambient_K
+                T_ambient = self.chimney.parts[-1].T_ambient_K
                 P_ambient = part.Pa
 
                 rho_gas = self.chimney.density[step, seg]
@@ -243,7 +243,7 @@ class DraftAnalyzer:
         ax1.grid(True, alpha=0.3)
         
         # Add theoretical line
-        T_ambient = self.chimney.parts[0].T_ambient_K - 273.15
+        T_ambient = self.chimney.parts[-1].T_ambient_K - 273.15
         T_range = np.linspace(T_ambient, avg_gas_temp.max(), 100)
         P_ambient = self.chimney.parts[0].Pa
         rho_ambient = self.chimney.physics.air_density(T_ambient + 273.15, P_ambient)
