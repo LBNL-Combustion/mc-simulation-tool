@@ -1418,9 +1418,11 @@ class Chimney:
             return None
 
         # 1. Inlet fitting at (-1, 0)
+        inlet_rise = 0.0
         inlet = _find_fitting(-1, 0)
         if inlet is not None:
-            elev += self._fitting_vertical_contribution(inlet)
+            inlet_rise = self._fitting_vertical_contribution(inlet)
+            elev += inlet_rise
             path += self._fitting_path_contribution(inlet)
 
         seg_idx = 0
@@ -1450,8 +1452,20 @@ class Chimney:
             if pi < n_parts - 1:
                 jf = _find_fitting(pi, pi + 1)
                 if jf is not None:
-                    elev += self._fitting_vertical_contribution(jf)
+                    jf_rise = self._fitting_vertical_contribution(jf)
+                    elev += jf_rise
+                    # A fitting's vertical rise is real hot column and must be
+                    # integrated for buoyancy. Charge it to the same segment the
+                    # fitting's K loss is attached to (_process_elbows: last
+                    # segment of the upstream part), which is also the part whose
+                    # T_ambient_K matches the fitting's own declared ambient.
+                    self.segment_vertical_heights[seg_idx - 1] += jf_rise
                     path += self._fitting_path_contribution(jf)
+
+        # Inlet fitting rise: same rule, charged to segment (0, 0) -- the segment
+        # _process_elbows attaches the inlet fitting's K loss to. Applied after the
+        # loop because segment 0's entry is written inside it.
+        self.segment_vertical_heights[0] += inlet_rise
 
     # ------------------------------------------------------------------
     # Fittings thermal model
