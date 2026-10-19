@@ -554,6 +554,7 @@ class Chimney:
         self._wind_cfg = self._parse_wind_cap(self.top_boundary)
         self._deltaP_wind_cap_static = None
         self._last_deltaP_wind_cap = 0.0
+        self._deltaP_wind_by_step = {}
         self.K_exit = float(self.top_boundary.get('K_exit', 0.0))
 
         if self._wind_cfg.enable and self._wind_cfg.update_mode == "static":
@@ -573,6 +574,7 @@ class Chimney:
                 theta_deg=self._wind_cfg.wind_direction_deg,
                 gust_factor=self._wind_cfg.gust_factor,
                 Cp_override=self._wind_cfg.Cp_override,
+                flue_flow_factor=self._wind_cfg.flue_flow_factor,
             )
             self._last_deltaP_wind_cap = self._deltaP_wind_cap_static
 
@@ -1834,6 +1836,7 @@ class Chimney:
             gust_factor=tb.get("gust_factor", 1.0),
             Cp_override=tb.get("Cp_override", None),
             update_mode=tb.get("wind_cap_update", "dynamic"),
+            flue_flow_factor=tb.get("flue_flow_factor", 1.0),
         )
 
     def _initialize_inlet_restriction(self, inlet_restriction: Optional[Dict[str, Any]]):
@@ -2332,8 +2335,10 @@ class Chimney:
             theta_deg=cfg.wind_direction_deg,
             gust_factor=cfg.gust_factor,
             Cp_override=cfg.Cp_override,
+            flue_flow_factor=cfg.flue_flow_factor,
         )
         self._last_deltaP_wind_cap = dP
+        self._deltaP_wind_by_step[step_index] = dP
         return dP
 
     def get_stack_differential_pressure(self, timestep=-1, measurement_height_m=None):
@@ -2514,7 +2519,9 @@ class Chimney:
         P_reference = np.where(node_outdoors, P_outdoor, P_ambient)
 
         P_inside = np.zeros(n_segs + 1)
-        deltaP_wind = getattr(self, '_last_deltaP_wind_cap', 0.0)
+        # wind pressure the solver used at this step (the last step's value is wrong for a time-varying wind)
+        _by_step = getattr(self, '_deltaP_wind_by_step', {})
+        deltaP_wind = _by_step.get(timestep, _by_step.get(timestep + 1, getattr(self, '_last_deltaP_wind_cap', 0.0)))
 
         dp_exit = 0.0
         K_exit = getattr(self, 'K_exit', 0.0)
@@ -2522,7 +2529,9 @@ class Chimney:
             last_seg = n_segs - 1
             rho_exit = self.density[timestep, last_seg]
             v_exit = self.velocity[timestep, last_seg]
-            dp_exit = K_exit * 0.5 * rho_exit * v_exit**2
+            # K_exit is the total-pressure loss at the termination (Haysom & Swinton 1987), which includes
+            # the exit velocity head; the static pressure just inside the outlet is (K - 1) velocity heads above outdoors
+            dp_exit = (K_exit - 1.0) * 0.5 * rho_exit * v_exit**2
 
         P_inside[n_segs] = P_outdoor[n_segs] + deltaP_wind + dp_exit
 

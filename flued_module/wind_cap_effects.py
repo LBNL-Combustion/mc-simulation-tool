@@ -5,8 +5,15 @@ Models aerodynamic pressure at the top termination caused by ambient wind
 flowing past the cap. Negative Cp (suction) aids draft; positive Cp
 (pressurization) reduces draft.
 
-Physics: ΔP_wind = Cp * (0.5 * ρ * V²) * G
-where Cp depends on cap geometry, exposure, and incidence angle.
+Physics: ΔP_wind = Cp * F_flow * (0.5 * ρ * V²) * G
+where Cp is the blocked-flue wind pressure coefficient of the termination
+and F_flow reduces it when the flue is flowing.
+
+Source for the coefficients: Haysom, J.C. and Swinton, M.C. (1987). The
+Influence of Termination Configuration on the Flow Performance of Flues.
+Canada Mortgage and Housing Corporation, Ottawa (wind tunnel tests by RWDI).
+Haysom defines the coefficient as the rise in draft inside the flue divided
+by the wind dynamic pressure, so their positive values are negative here.
 """
 
 from dataclasses import dataclass
@@ -25,19 +32,38 @@ class WindCapConfig:
     gust_factor: float = 1.0
     Cp_override: Union[float, None] = None
     update_mode: str = "dynamic"   # "dynamic" or "static"
+    flue_flow_factor: float = 1.0  # 1.0 = blocked flue (start-up); see FLUE_FLOW_FACTOR
 
-# Baseline pressure coefficients from literature
+# Blocked-flue wind pressure coefficients, 0 deg wind, Haysom & Swinton (1987) Table 1A
 # Negative = suction (aids draft), Positive = pressurization (hurts draft)
 BASELINE_CP = {
-    "open":     -0.10,   # Mild suction from shear over lip
-    "rain_cap": +0.05,   # Blockage causes weak pressurization
-    "shrouded": -0.20,   # Sheltering shroud creates modest suction
-    "cone":     -0.30,   # Diffuser/venturi-like geometry
-    "venturi":  -0.50,   # Strong suction from venturi effect
-    "H_cap":    -0.05,   # Near-neutral, resists down-draft
+    "open":          -1.626,  # open masonry chimney
+    "rain_cap":      -0.728,  # A-vent, high-temperature cap for factory-built solid-fuel chimneys (Class A)
+    "b_vent":        -0.503,  # B-vent (gas vent) cap
+    "aerocowl":      -0.580,  # Aerocowl
+    "cap_and_grill": -0.958,  # masonry cap and grill
 }
 
-# Exposure scalar reduces wind effect in sheltered locations
+# Cap flow loss K (velocity heads of total pressure lost at the termination, including
+# the exit velocity head), Haysom & Swinton (1987) Table 2. Pass as top_boundary['K_exit'].
+CAP_K_EXIT = {
+    "open":          0.71,
+    "rain_cap":      1.05,
+    "b_vent":        1.38,
+    "aerocowl":      3.58,
+    "cap_and_grill": 1.00,
+}
+
+# With the flue flowing, the wind pressure across the cap drops (Haysom & Swinton 1987, Fig. 7,
+# 10 km/h wind): about 0.7 of the blocked value for the A-vent and 0.5 to 0.6 for the B-vent.
+# Haysom recommend the blocked value for low-flow start-up and the unblocked value for a full burn.
+# Pass as top_boundary['flue_flow_factor']; the default 1.0 is the blocked flue.
+FLUE_FLOW_FACTOR = {
+    "rain_cap": 0.7,
+    "b_vent":   0.55,
+}
+
+# Exposure scalar reduces wind effect in sheltered locations (not from Haysom; no source)
 EXPOSURE_SCALAR = {
     "open":      1.00,   # Full wind exposure
     "suburban":  0.85,   # Partial sheltering
@@ -67,7 +93,7 @@ def incidence_factor(theta_deg: float) -> float:
     Incidence angle correction factor for directional effects
 
     For vertical stacks, azimuthal sensitivity is weak. Currently returns 1.0.
-    Hook for future implementation: F(θ) = 1 - 0.15*sin²(θ)
+    Haysom Table 1A gives the coefficients at -45 to +45 deg; only 0 deg is used here.
 
     Args:
         theta_deg: Wind direction angle (degrees)
@@ -75,7 +101,6 @@ def incidence_factor(theta_deg: float) -> float:
     Returns:
         Incidence factor (dimensionless, typically near 1.0)
     """
-    # Placeholder: vertical stacks weakly depend on wind azimuth
     return 1.0
 
 
@@ -85,10 +110,11 @@ def cap_Cp(cap_type: str, exposure: str, theta_deg: float,
     Calculate effective pressure coefficient for cap
 
     Combines baseline Cp (geometry), exposure scalar (sheltering),
-    and incidence factor (angle). Clamps to ±0.8 for safety.
+    and incidence factor (angle). Clamps to ±2.0 for safety
+    (the largest measured value is 1.626, open chimney).
 
     Args:
-        cap_type: Cap geometry type (e.g., "venturi", "rain_cap")
+        cap_type: Cap geometry type (a key of BASELINE_CP)
         exposure: Site exposure ("open", "suburban", "sheltered")
         theta_deg: Wind direction angle (degrees)
         Cp_override: If provided, bypasses calculation and uses this value
@@ -99,26 +125,30 @@ def cap_Cp(cap_type: str, exposure: str, theta_deg: float,
     if Cp_override is not None:
         return Cp_override
 
-    Cp0 = BASELINE_CP.get(cap_type, -0.10)
+    if cap_type not in BASELINE_CP:
+        raise ValueError(f"Unknown cap_type '{cap_type}'; use one of {sorted(BASELINE_CP)} "
+                         f"or set Cp_override")
+    Cp0 = BASELINE_CP[cap_type]
     E = EXPOSURE_SCALAR.get(exposure, 1.0)
     F = incidence_factor(theta_deg)
 
     Cp = Cp0 * E * F
 
-    # Safety clamp: |Cp| ≤ 0.8
-    return max(min(Cp, 0.8), -0.8)
+    return max(min(Cp, 2.0), -2.0)
 
 
 def wind_cap_deltaP(Pa: float, T_out_K: float, V_wind: float,
                     cap_type: str, exposure: str, theta_deg: float,
                     gust_factor: float = 1.0,
-                    Cp_override: Union[float, None] = None) -> float:
+                    Cp_override: Union[float, None] = None,
+                    flue_flow_factor: float = 1.0) -> float:
     """
     Calculate wind-induced pressure at chimney cap
 
-    Physics: ΔP = Cp * q * G
+    Physics: ΔP = Cp * F_flow * q * G
     where q = 0.5 * ρ * V² (dynamic pressure)
-          Cp = pressure coefficient (geometry, exposure, angle)
+          Cp = blocked-flue pressure coefficient (geometry, exposure, angle)
+          F_flow = reduction with the flue flowing (1.0 = blocked)
           G = gust factor
 
     Sign convention:
@@ -134,6 +164,7 @@ def wind_cap_deltaP(Pa: float, T_out_K: float, V_wind: float,
         theta_deg: Wind direction angle (degrees)
         gust_factor: Gust multiplier (default 1.0)
         Cp_override: Optional Cp override
+        flue_flow_factor: Multiplier for a flowing flue (default 1.0)
 
     Returns:
         Wind pressure effect ΔP_wind (Pa)
@@ -152,7 +183,7 @@ def wind_cap_deltaP(Pa: float, T_out_K: float, V_wind: float,
     Cp = cap_Cp(cap_type, exposure, theta_deg, Cp_override)
 
     # Wind-induced pressure
-    return Cp * q * gust_factor
+    return Cp * flue_flow_factor * q * gust_factor
 
 
 # Validation and example usage
@@ -161,50 +192,38 @@ if __name__ == "__main__":
     print("WIND CAP EFFECTS - VALIDATION TESTS")
     print("="*70)
 
-    # Test case: venturi cap, 5 m/s wind
-    Pa = 98457.0
-    T = 294.15
-    V = 5.0
+    # Test case: 10 km/h wind, as in Haysom Table 1B
+    Pa = 101325.0
+    T = 273.15  # Table 1B values imply q of about 4.95 Pa at 10 km/h, i.e. air near 0 C
+    V = 10.0 / 3.6
 
     print("\nReference Case:")
     print(f"  Ambient: {Pa:.0f} Pa, {T:.1f} K")
-    print(f"  Wind speed: {V:.1f} m/s")
+    print(f"  Wind speed: {V:.2f} m/s")
 
     rho = air_density(Pa, T)
     q = 0.5 * rho * V**2
     print(f"  Air density: {rho:.3f} kg/m³")
     print(f"  Dynamic pressure q: {q:.2f} Pa")
 
-    print("\nCap Type Effects:")
-    for cap in ["venturi", "cone", "shrouded", "open", "H_cap", "rain_cap"]:
+    print("\nCap Type Effects (blocked flue; Haysom Table 1B, 0 deg, 10 km/h, for comparison):")
+    table_1b = {"rain_cap": 3.6, "b_vent": 2.5, "aerocowl": 2.9, "open": 8.1, "cap_and_grill": 4.8}
+    for cap in BASELINE_CP:
         dP = wind_cap_deltaP(Pa, T, V, cap, "open", 0.0)
-        sign = "suction" if dP < 0 else "pressurization"
-        effect = "aids draft" if dP < 0 else "hurts draft"
-        Cp = cap_Cp(cap, "open", 0.0, None)
-        print(f"  {cap:12s}: Cp={Cp:+.2f}, dP={dP:+6.2f} Pa ({sign:15s}, {effect})")
+        print(f"  {cap:14s}: Cp={cap_Cp(cap, 'open', 0.0, None):+.3f}, dP={dP:+6.2f} Pa "
+              f"(Haysom {-table_1b[cap]:+.1f} Pa), K_exit={CAP_K_EXIT[cap]:.2f}")
 
-    print("\nExposure Effects (venturi cap):")
-    for exp in ["open", "suburban", "sheltered"]:
-        dP = wind_cap_deltaP(Pa, T, V, "venturi", exp, 0.0)
-        Cp = cap_Cp("venturi", exp, 0.0, None)
-        print(f"  {exp:10s}: Cp={Cp:+.2f}, dP={dP:+6.2f} Pa")
-
-    print("\nWind Speed Sensitivity (venturi, open):")
-    for V_test in [0, 2, 5, 10, 15]:
-        dP = wind_cap_deltaP(Pa, T, V_test, "venturi", "open", 0.0)
-        print(f"  V={V_test:2d} m/s: dP={dP:+7.2f} Pa")
+    print("\nRain cap with the flue flowing (factor 0.7):")
+    dP = wind_cap_deltaP(Pa, T, V, "rain_cap", "open", 0.0, flue_flow_factor=0.7)
+    print(f"  dP={dP:+6.2f} Pa")
 
     print("\nSign Convention Validation:")
-    dP_venturi = wind_cap_deltaP(Pa, T, V, "venturi", "open", 0.0)
-    dP_rain = wind_cap_deltaP(Pa, T, V, "rain_cap", "open", 0.0)
-
-    assert dP_venturi < 0, "Venturi should create suction (negative ΔP)"
-    assert dP_rain > 0, "Rain cap should create pressurization (positive ΔP)"
-    assert abs(dP_venturi) > abs(dP_rain), "Venturi should have larger magnitude"
-
-    print("  [OK] Venturi creates suction (aids draft)")
-    print("  [OK] Rain cap creates pressurization (hurts draft)")
-    print("  [OK] Magnitudes correct")
+    for cap in BASELINE_CP:
+        dP = wind_cap_deltaP(Pa, T, V, cap, "open", 0.0)
+        assert dP < 0, f"{cap}: wind across the cap should add draft (negative ΔP)"
+        assert abs(dP + table_1b[cap]) < 0.15, f"{cap}: {dP:.2f} Pa does not match Haysom Table 1B"
+    print("  [OK] Every cap creates suction (aids draft), as measured by Haysom & Swinton (1987)")
+    print("  [OK] Magnitudes match Haysom Table 1B within 0.15 Pa")
 
     print("\n" + "="*70)
     print("ALL VALIDATION TESTS PASSED")
