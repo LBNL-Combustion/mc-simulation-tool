@@ -350,7 +350,10 @@ class CoupledFlowThermalSolver:
         # A_eff includes leakage floor to keep resistance finite when door is closed
         A_eff = chimney.inlet_restriction.effective_area_m2
         K = chimney.inlet_restriction.K_equiv  # 1/Cd^2
-        R_door = K / (2.0 * rho_inlet * A_eff**2)
+        # the air going through the door gap is room air, not flue gas
+        part0 = chimney.parts[0]
+        rho_room = chimney.physics.air_density(part0.T_ambient_K, part0.Pa)
+        R_door = K / (2.0 * rho_room * A_eff**2)
 
         # Stove body resistance (fuel bed, baffles, flue collar) uses pipe area
         R_stove = 0.0
