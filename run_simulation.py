@@ -80,6 +80,7 @@ def run_simulation(config: dict) -> dict:
         top_boundary : dict         -- wind cap config (optional)
         fittings_thermal : dict     -- fitting thermal model (optional)
         door_temp_dilution : dict   -- inlet air mixing (optional)
+        house_stack : dict          -- house stack effect {'enable', 'npp_height_m'} (optional)
         verbose : bool              -- print solver details (default False)
 
     Returns
@@ -101,6 +102,7 @@ def run_simulation(config: dict) -> dict:
     top_boundary = config.get('top_boundary', None)
     fittings_thermal = config.get('fittings_thermal', None)
     door_temp_dilution = config.get('door_temp_dilution', None)
+    house_stack = config.get('house_stack', None)
     verbose = config.get('verbose', False)
 
     # --- Build callables from JSON-friendly specs ---
@@ -117,6 +119,7 @@ def run_simulation(config: dict) -> dict:
         top_boundary=top_boundary,
         fittings_thermal=fittings_thermal,
         door_temp_dilution=door_temp_dilution,
+        house_stack=house_stack,
         inlet_temp_func=inlet_temp_func,
         door_opening_func=door_opening_func,
         use_coupled_solver=True,
