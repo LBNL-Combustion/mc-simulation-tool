@@ -988,7 +988,7 @@ class CoupledFlowThermalSolver:
             # Inlet boundary T is set by fire/appliance and may exceed these bounds
             if not is_inlet_boundary:
                 T_min_physical = part.T_ambient_K
-                T_max_physical = 1073.15  # 800 degC
+                T_max_physical = 1423.15  # 1150 degC = 2100 F, UL 103 HT chimney fire test temperature
                 new_temperatures[seg] = max(new_temperatures[seg], T_min_physical)
                 new_temperatures[seg] = min(new_temperatures[seg], T_max_physical)
 
