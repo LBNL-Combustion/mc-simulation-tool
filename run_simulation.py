@@ -80,6 +80,11 @@ def run_simulation(config: dict) -> dict:
         top_boundary : dict         -- wind cap config (optional)
         fittings_thermal : dict     -- fitting thermal model (optional)
         door_temp_dilution : dict   -- inlet air mixing (optional)
+        house_stack : dict          -- house stack effect {'enable', 'npp_height_m'} (optional)
+        elevation_ft : float | None -- site elevation [ft]; null uses the per-part Pa (default 0.0)
+        room_pressure_offset_Pa : float -- room pressure offset [Pa] (default 0.0)
+        external_ht_config : dict   -- external heat transfer options {'exact_radiation',
+                                       'cylinder_nc_correction', 'external_air_speed_m_s'} (optional)
         verbose : bool              -- print solver details (default False)
 
     Returns
@@ -101,6 +106,10 @@ def run_simulation(config: dict) -> dict:
     top_boundary = config.get('top_boundary', None)
     fittings_thermal = config.get('fittings_thermal', None)
     door_temp_dilution = config.get('door_temp_dilution', None)
+    house_stack = config.get('house_stack', None)
+    elevation_ft = config.get('elevation_ft', 0.0)
+    room_pressure_offset_Pa = config.get('room_pressure_offset_Pa', 0.0)
+    external_ht_config = config.get('external_ht_config', None)
     verbose = config.get('verbose', False)
 
     # --- Build callables from JSON-friendly specs ---
@@ -117,6 +126,10 @@ def run_simulation(config: dict) -> dict:
         top_boundary=top_boundary,
         fittings_thermal=fittings_thermal,
         door_temp_dilution=door_temp_dilution,
+        house_stack=house_stack,
+        elevation_ft=elevation_ft,
+        room_pressure_offset_Pa=room_pressure_offset_Pa,
+        external_ht_config=external_ht_config,
         inlet_temp_func=inlet_temp_func,
         door_opening_func=door_opening_func,
         use_coupled_solver=True,

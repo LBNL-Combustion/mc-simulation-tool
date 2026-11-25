@@ -484,6 +484,7 @@ class Chimney:
                  inlet_temp_func: Optional[callable] = None,
                  door_temp_dilution: Optional[Dict[str, Any]] = None,
                  room_pressure_offset_Pa = 0.0,  # float or callable(t_s) -> Pa
+                 house_stack: Optional[Dict[str, Any]] = None,
                  leakage_config: Optional[Dict[str, Any]] = None,
                  enable_diagnostics: bool = False,
                  momentum_config: Optional[Dict[str, Any]] = None,
@@ -491,7 +492,10 @@ class Chimney:
                  fittings_thermal: Optional[Dict[str, Any]] = None,
                  solver_relaxation: Optional[float] = None,
                  solver_alpha_cap: Optional[float] = None,
-                 elevation_ft: float = 0.0,
+                 elevation_ft: Optional[float] = 0.0,
+                 h_inner_multiplier: float = 1.0,
+                 h_outer_multiplier: float = 1.0,
+                 external_ht_config: Optional[Dict[str, Any]] = None,
                  verbose: bool = False):
         """Initialize chimney simulation.
 
@@ -510,10 +514,17 @@ class Chimney:
             enable_diagnostics: Record per-timestep momentum/energy budgets
             momentum_config: Dict or MomentumConfig for momentum physics
             room_plenum: Dict or RoomPlenum for room depressurization
-            elevation_ft: Site elevation above sea level [ft]. Used to compute
-                ambient pressure via the ISA barometric formula; overrides any
-                Pa value supplied in per-part dicts. Default 0 ft (sea level,
-                101325 Pa). For LBNL lab use elevation_ft=787 (~98457 Pa).
+            house_stack: House stack effect, as in FLUESIM/WOODSIM: {'enable': True,
+                'npp_height_m': h}. The indoor air column between the appliance and the
+                envelope's neutral pressure plane (h above the appliance) leaves the room
+                g * h * (rho_outdoor - rho_indoor) below outdoor pressure at the appliance.
+                Added to room_pressure_offset_Pa (not used with the room plenum).
+            elevation_ft: Site elevation above sea level [ft]. Sets the single
+                ambient pressure the flow solver uses.
+                * 0.0 -> ISA sea-level pressure (101325 Pa), applied to all parts.
+                * A number (e.g. 787 ~= 98476 Pa) -> ISA pressure at that elevation.
+                * None -> use the exact Pa supplied in the per-part dicts (e.g. a
+                  measured barometric pressure).
             fittings_thermal: Dict for fitting thermal model config
         """
         self.inlet_temp_csv = inlet_temp_csv
@@ -524,11 +535,17 @@ class Chimney:
         self.total_time = total_time
         self.time_steps = int(total_time / dt)
 
-        # Site elevation -> ambient pressure (ISA barometric formula).
-        # Overrides any per-part Pa so all downstream physics sees one site pressure.
+        # Site ambient pressure -> one site pressure (self.Pa_ambient) for all parts.
+        # elevation_ft=0.0 -> ISA sea-level pressure (101325 Pa); a number -> ISA
+        # pressure at that elevation; None -> use the per-part Pa values directly.
         self.elevation_ft = elevation_ft
-        self.elevation_m = elevation_ft * 0.3048
-        self.Pa_ambient = PhysicalProperties.pressure_from_elevation(self.elevation_m)
+        if elevation_ft is None:
+            self.elevation_m = 0.0
+            _part_pas = [p.get('Pa') for p in parts if p.get('Pa') is not None]
+            self.Pa_ambient = float(_part_pas[0]) if _part_pas else 101325.0
+        else:
+            self.elevation_m = elevation_ft * 0.3048
+            self.Pa_ambient = PhysicalProperties.pressure_from_elevation(self.elevation_m)
         parts = [{**part, 'Pa': self.Pa_ambient} for part in parts]
 
         self.parts = [ChimneyPart(**part) for part in parts]
@@ -548,12 +565,20 @@ class Chimney:
             print("Consider using a smaller time step if numerical instabilities occur.")
 
         self.physics = PhysicalProperties()
-        self.comprehensive_ht = ComprehensiveHeatTransfer()
+        _ext = external_ht_config or {}
+        self.comprehensive_ht = ComprehensiveHeatTransfer(
+            h_inner_multiplier=h_inner_multiplier,
+            h_outer_multiplier=h_outer_multiplier,
+            exact_radiation=_ext.get('exact_radiation', False),
+            cylinder_nc_correction=_ext.get('cylinder_nc_correction', False),
+            local_nc_length=_ext.get('local_nc_length', False),
+            external_air_speed_m_s=_ext.get('external_air_speed_m_s', 0.0))
 
         self.top_boundary = top_boundary if top_boundary is not None else {}
         self._wind_cfg = self._parse_wind_cap(self.top_boundary)
         self._deltaP_wind_cap_static = None
         self._last_deltaP_wind_cap = 0.0
+        self._deltaP_wind_by_step = {}
         self.K_exit = float(self.top_boundary.get('K_exit', 0.0))
 
         if self._wind_cfg.enable and self._wind_cfg.update_mode == "static":
@@ -573,6 +598,7 @@ class Chimney:
                 theta_deg=self._wind_cfg.wind_direction_deg,
                 gust_factor=self._wind_cfg.gust_factor,
                 Cp_override=self._wind_cfg.Cp_override,
+                flue_flow_factor=self._wind_cfg.flue_flow_factor,
             )
             self._last_deltaP_wind_cap = self._deltaP_wind_cap_static
 
@@ -665,6 +691,19 @@ class Chimney:
         else:
             self._room_pressure_func = None
             self.room_pressure_offset_Pa = room_pressure_offset_Pa
+
+        # House stack effect (FLUESIM/WOODSIM chimney-house circuit): indoor air from the appliance
+        # up to the neutral pressure plane, outdoor air above it. Constant over the run.
+        hs = house_stack or {}
+        self.dp_house_stack_Pa = 0.0
+        if hs.get('enable', False):
+            P0 = self.parts[0].Pa
+            rho_in = self.physics.air_density(hs.get('T_indoor_K', self.parts[0].T_ambient_K), P0)
+            rho_out = self.physics.air_density(hs.get('T_outdoor_K', self.parts[-1].T_ambient_K), P0)
+            self.dp_house_stack_Pa = 9.81 * float(hs['npp_height_m']) * (rho_out - rho_in)
+            base = self._room_pressure_func or (lambda t, c=self.room_pressure_offset_Pa: c)
+            self._room_pressure_func = lambda t, f=base, d=self.dp_house_stack_Pa: f(t) + d
+            self.room_pressure_offset_Pa = self._room_pressure_func(0.0)
 
         self.segment_lengths = np.zeros(self.total_segments)
         seg_idx = 0
@@ -1834,6 +1873,7 @@ class Chimney:
             gust_factor=tb.get("gust_factor", 1.0),
             Cp_override=tb.get("Cp_override", None),
             update_mode=tb.get("wind_cap_update", "dynamic"),
+            flue_flow_factor=tb.get("flue_flow_factor", 1.0),
         )
 
     def _initialize_inlet_restriction(self, inlet_restriction: Optional[Dict[str, Any]]):
@@ -2332,8 +2372,10 @@ class Chimney:
             theta_deg=cfg.wind_direction_deg,
             gust_factor=cfg.gust_factor,
             Cp_override=cfg.Cp_override,
+            flue_flow_factor=cfg.flue_flow_factor,
         )
         self._last_deltaP_wind_cap = dP
+        self._deltaP_wind_by_step[step_index] = dP
         return dP
 
     def get_stack_differential_pressure(self, timestep=-1, measurement_height_m=None):
@@ -2514,7 +2556,9 @@ class Chimney:
         P_reference = np.where(node_outdoors, P_outdoor, P_ambient)
 
         P_inside = np.zeros(n_segs + 1)
-        deltaP_wind = getattr(self, '_last_deltaP_wind_cap', 0.0)
+        # wind pressure the solver used at this step (the last step's value is wrong for a time-varying wind)
+        _by_step = getattr(self, '_deltaP_wind_by_step', {})
+        deltaP_wind = _by_step.get(timestep, _by_step.get(timestep + 1, getattr(self, '_last_deltaP_wind_cap', 0.0)))
 
         dp_exit = 0.0
         K_exit = getattr(self, 'K_exit', 0.0)
@@ -2522,7 +2566,11 @@ class Chimney:
             last_seg = n_segs - 1
             rho_exit = self.density[timestep, last_seg]
             v_exit = self.velocity[timestep, last_seg]
-            dp_exit = K_exit * 0.5 * rho_exit * v_exit**2
+            # K_exit is the total-pressure loss at the termination (Haysom & Swinton 1987), which includes
+            # the exit velocity head; the static pressure just inside the outlet is (K - 1) velocity heads above outdoors.
+            # In reverse flow (air entering through the cap from still outdoor air) the same total loss K applies,
+            # as in the momentum solver, so the static pressure just inside is (K + 1) velocity heads below outdoors.
+            dp_exit = (K_exit * np.sign(v_exit) - 1.0) * 0.5 * rho_exit * v_exit**2
 
         P_inside[n_segs] = P_outdoor[n_segs] + deltaP_wind + dp_exit
 
@@ -2555,14 +2603,15 @@ class Chimney:
                 else:
                     f = 0.25 / (np.log10(relative_roughness/3.7 + 5.74/Re**0.9))**2
 
-                dP_friction = f * (seg_length / diameter) * 0.5 * rho_gas * velocity**2
+                # losses act against the flow: v|v| (as in the momentum solver), so in reverse flow they lower the pressure downward
+                dP_friction = f * (seg_length / diameter) * 0.5 * rho_gas * velocity * abs(velocity)
 
             dP_fitting = 0.0
             elbow_key = (part_idx, local_seg)
             if hasattr(self, 'segment_elbows') and elbow_key in self.segment_elbows:
                 for elbow_spec in self.segment_elbows[elbow_key]:
                     K_fitting = base_K(elbow_spec) * elbow_spec.vane_factor
-                    dP_fitting += K_fitting * 0.5 * rho_gas * velocity**2
+                    dP_fitting += K_fitting * 0.5 * rho_gas * velocity * abs(velocity)
 
             # Accumulate totals for diagnostics
             # Buoyancy = ambient hydrostatic - gas hydrostatic (positive = upward draft)
@@ -2600,18 +2649,20 @@ class Chimney:
                 # NOT subtracted: already in the integration via momentum solver
 
         # --- Room depressurization ---
-        # dp_room IS needed: the top boundary is at P_ambient(outdoor),
-        # but the room (chimney inlet) is at P_ambient - dp_room.
-        # The integration doesn't know this — it only uses gas properties.
+        # The top boundary is at outdoor pressure, so P_inside is the gas pressure itself. The room
+        # (the reference at indoor nodes) sits dp_room BELOW the undisturbed room column, so indoor
+        # gauge pressures are taken against P_ambient - dp_room. Outdoor nodes keep the outdoor
+        # reference. (Before: P_inside was lowered by dp_room, i.e. referenced to a room ABOVE
+        # outdoor pressure; notebooks that added dp_room back got the outdoor reference.)
         _dp_room = 0.0
         if True:
             t_s = timestep * self.dt
             if self._room_pressure_func is not None:
                 _dp_room = self._room_pressure_func(t_s)
-            elif self.room_plenum.cfg.enable:
+            else:
                 _dp_room = self.room_pressure_offset_Pa
             if _dp_room != 0.0:
-                P_inside[:] -= _dp_room
+                P_reference = np.where(node_outdoors, P_reference, P_reference - _dp_room)
 
         P_gauge = P_inside - P_reference
 
